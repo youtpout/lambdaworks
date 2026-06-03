@@ -25,7 +25,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
 const SEED: [u8; 32] = [0x42; 32];
-const BENCH_SIZES: &[usize] = &[1 << 10, 1 << 12, 1 << 14];
+const BENCH_SIZES: &[usize] = &[1 << 12, 1 << 18, 1 << 22];
 
 type Scalar = UnsignedInteger<4>;
 type LwPallasPoint = ShortWeierstrassProjectivePoint<PallasCurve>;
