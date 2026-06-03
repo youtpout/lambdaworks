@@ -151,6 +151,38 @@ fn compile_metal_shaders() {
     println!("cargo:rustc-cfg=metal_shaders_compiled");
 }
 
+/// Links against the ROCm HIP runtime and hipRTC.
+///
+/// The HIP kernel source is compiled at runtime by hipRTC, so no build-time
+/// invocation of `hipcc` is needed here.  We only need to tell Cargo where to
+/// find the shared libraries.
+#[cfg(feature = "rocm")]
+fn link_rocm() {
+    use std::env;
+    use std::path::PathBuf;
+
+    // Honour $ROCM_PATH if set; otherwise default to /opt/rocm.
+    let rocm_root = env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".to_string());
+    let lib_dir = PathBuf::from(&rocm_root).join("lib");
+
+    if !lib_dir.exists() {
+        println!(
+            "cargo:warning=ROCm lib directory not found at {}. \
+             Set ROCM_PATH to your ROCm installation root.",
+            lib_dir.display()
+        );
+        return;
+    }
+
+    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    println!("cargo:rustc-link-lib=dylib=amdhip64");
+    println!("cargo:rustc-link-lib=dylib=hiprtc");
+    println!("cargo:rerun-if-env-changed=ROCM_PATH");
+    println!(
+        "cargo:rerun-if-changed=src/rocm/shaders/pippenger_msm/pippenger_msm.hip"
+    );
+}
+
 fn main() {
     // Declare the expected cfg for the compiler
     println!("cargo:rustc-check-cfg=cfg(metal_shaders_compiled)");
@@ -160,4 +192,7 @@ fn main() {
 
     #[cfg(feature = "metal")]
     compile_metal_shaders();
+
+    #[cfg(feature = "rocm")]
+    link_rocm();
 }

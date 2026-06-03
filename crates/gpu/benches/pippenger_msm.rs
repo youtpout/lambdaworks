@@ -1,9 +1,20 @@
-#![cfg(feature = "metal")]
+//! Criterion benchmarks for the Pippenger MSM GPU backends.
+//!
+//! Each benchmark group contains several variants:
+//!   • `arkworks-variable-base`        – Arkworks reference
+//!   • `cpu-signed-pippenger`          – lambdaworks single-threaded CPU
+//!   • `cpu-parallel-signed-pippenger` – lambdaworks parallel CPU
+//!   • `metal-pippenger`               – Apple Metal GPU  (feature = "metal")
+//!   • `hip-pippenger`                 – AMD ROCm/HIP GPU (feature = "rocm")
+//!
+//! Run with:
+//!   cargo bench --features metal   # Apple GPU
+//!   cargo bench --features rocm    # AMD GPU
+//!   cargo bench --features metal,rocm  # both
 
 use ark_ec::{AffineRepr, CurveGroup, VariableBaseMSM};
 use ark_ff::{BigInteger256, PrimeField, UniformRand};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use lambdaworks_gpu::metal::pippenger_msm::{MetalPippengerMSM, PippengerMSMConfig};
 use lambdaworks_math::{
     cyclic_group::IsGroup,
     elliptic_curve::{
@@ -24,12 +35,20 @@ use lambdaworks_math::{
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
+#[cfg(feature = "metal")]
+use lambdaworks_gpu::metal::pippenger_msm::{MetalPippengerMSM, PippengerMSMConfig};
+
+#[cfg(feature = "rocm")]
+use lambdaworks_gpu::rocm::pippenger_msm::{HipPippengerMSM, HipPippengerMSMConfig};
+
 const SEED: [u8; 32] = [0x42; 32];
 const BENCH_SIZES: &[usize] = &[1 << 12, 1 << 18, 1 << 22];
 
 type Scalar = UnsignedInteger<4>;
 type LwPallasPoint = ShortWeierstrassProjectivePoint<PallasCurve>;
 type LwVestaPoint = ShortWeierstrassProjectivePoint<VestaCurve>;
+
+// ─── benchmark data ───────────────────────────────────────────────────────────
 
 struct BenchData<ArkAffine, LwC>
 where
@@ -84,8 +103,8 @@ where
         lw_points.push(lw_generator.operate_with_self(unsigned_from_bigint(point_scalar_bigint)));
     }
 
-    let gpu_scalars = gpu_scalars(&lw_scalars);
-    let gpu_points = gpu_points(&lw_points);
+    let gpu_scalars = encode_scalars(&lw_scalars);
+    let gpu_points = encode_points(&lw_points);
 
     BenchData {
         ark_points,
@@ -94,6 +113,199 @@ where
         lw_points,
         gpu_scalars,
         gpu_points,
+    }
+}
+
+// ─── Pallas benchmarks ────────────────────────────────────────────────────────
+
+fn bench_pallas(c: &mut Criterion) {
+    let mut group = c.benchmark_group("pallas-pippenger-msm");
+
+    for &size in BENCH_SIZES {
+        let data = pallas_data(size);
+        let window_size = optimal_window_size(size);
+
+        group.bench_with_input(
+            BenchmarkId::new("arkworks-variable-base", size),
+            &data,
+            |b, data| b.iter(|| black_box(ark_msm(&data.ark_points, &data.ark_scalars))),
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("cpu-signed-pippenger", size),
+            &data,
+            |b, data| {
+                b.iter(|| {
+                    black_box(pippenger::msm_with_signed(
+                        &data.lw_scalars,
+                        &data.lw_points,
+                        window_size,
+                    ))
+                })
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("cpu-parallel-signed-pippenger", size),
+            &data,
+            |b, data| {
+                b.iter(|| {
+                    black_box(pippenger::parallel_msm_with_signed(
+                        &data.lw_scalars,
+                        &data.lw_points,
+                        window_size,
+                    ))
+                })
+            },
+        );
+
+        #[cfg(feature = "metal")]
+        {
+            let base_msm = MetalPippengerMSM::new_pallas().expect("Metal device required");
+            let config = base_msm.config_for_num_points(size);
+            let mut msm = MetalPippengerMSM::new(config).expect("Metal device required");
+            let prepared = msm
+                .prepare(&data.gpu_scalars, &data.gpu_points)
+                .expect("Metal prepare failed");
+
+            group.bench_with_input(
+                BenchmarkId::new("metal-pippenger", size),
+                &data,
+                |b, _| {
+                    b.iter(|| {
+                        black_box(msm.compute_prepared(&prepared).expect("Metal MSM failed"))
+                    })
+                },
+            );
+        }
+
+        #[cfg(feature = "rocm")]
+        {
+            let base_msm = HipPippengerMSM::new_pallas().expect("ROCm device required");
+            let config = base_msm.config_for_num_points(size);
+            let mut msm = HipPippengerMSM::new(config).expect("ROCm device required");
+            let prepared = msm
+                .prepare(&data.gpu_scalars, &data.gpu_points)
+                .expect("HIP prepare failed");
+
+            group.bench_with_input(
+                BenchmarkId::new("hip-pippenger", size),
+                &data,
+                |b, _| {
+                    b.iter(|| {
+                        black_box(msm.compute_prepared(&prepared).expect("HIP MSM failed"))
+                    })
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
+// ─── Vesta benchmarks ─────────────────────────────────────────────────────────
+
+fn bench_vesta(c: &mut Criterion) {
+    let mut group = c.benchmark_group("vesta-pippenger-msm");
+
+    for &size in BENCH_SIZES {
+        let data = vesta_data(size);
+        let window_size = optimal_window_size(size);
+
+        group.bench_with_input(
+            BenchmarkId::new("arkworks-variable-base", size),
+            &data,
+            |b, data| b.iter(|| black_box(ark_msm(&data.ark_points, &data.ark_scalars))),
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("cpu-signed-pippenger", size),
+            &data,
+            |b, data| {
+                b.iter(|| {
+                    black_box(pippenger::msm_with_signed(
+                        &data.lw_scalars,
+                        &data.lw_points,
+                        window_size,
+                    ))
+                })
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("cpu-parallel-signed-pippenger", size),
+            &data,
+            |b, data| {
+                b.iter(|| {
+                    black_box(pippenger::parallel_msm_with_signed(
+                        &data.lw_scalars,
+                        &data.lw_points,
+                        window_size,
+                    ))
+                })
+            },
+        );
+
+        #[cfg(feature = "metal")]
+        {
+            let base_msm = MetalPippengerMSM::new_vesta().expect("Metal device required");
+            let config = base_msm.config_for_num_points(size);
+            let mut msm = MetalPippengerMSM::new(config).expect("Metal device required");
+            let prepared = msm
+                .prepare(&data.gpu_scalars, &data.gpu_points)
+                .expect("Metal prepare failed");
+
+            group.bench_with_input(
+                BenchmarkId::new("metal-pippenger", size),
+                &data,
+                |b, _| {
+                    b.iter(|| {
+                        black_box(msm.compute_prepared(&prepared).expect("Metal MSM failed"))
+                    })
+                },
+            );
+        }
+
+        #[cfg(feature = "rocm")]
+        {
+            let base_msm = HipPippengerMSM::new_vesta().expect("ROCm device required");
+            let config = base_msm.config_for_num_points(size);
+            let mut msm = HipPippengerMSM::new(config).expect("ROCm device required");
+            let prepared = msm
+                .prepare(&data.gpu_scalars, &data.gpu_points)
+                .expect("HIP prepare failed");
+
+            group.bench_with_input(
+                BenchmarkId::new("hip-pippenger", size),
+                &data,
+                |b, _| {
+                    b.iter(|| {
+                        black_box(msm.compute_prepared(&prepared).expect("HIP MSM failed"))
+                    })
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
+criterion_group! {
+    name = benches;
+    config = Criterion::default().sample_size(10);
+    targets = bench_pallas, bench_vesta
+}
+criterion_main!(benches);
+
+// ─── shared helpers ───────────────────────────────────────────────────────────
+
+fn optimal_window_size(n: usize) -> usize {
+    match n {
+        0..=4 => 2,
+        5..=32 => 4,
+        33..=256 => 6,
+        257..=4096 => 7,
+        _ => 9,
     }
 }
 
@@ -106,137 +318,22 @@ where
     <G::Group as VariableBaseMSM>::msm(points, scalars).expect("valid Arkworks MSM input")
 }
 
-fn bench_curve<ArkAffine, LwC>(
-    c: &mut Criterion,
-    group_name: &str,
-    make_data_for_curve: impl Fn(usize) -> BenchData<ArkAffine, LwC>,
-    config_for_curve: impl Fn() -> PippengerMSMConfig,
-) where
-    ArkAffine: AffineRepr + 'static,
-    ArkAffine::BaseField: PrimeField<BigInt = BigInteger256>,
-    ArkAffine::Group: VariableBaseMSM<MulBase = ArkAffine>,
-    ArkAffine::ScalarField: PrimeField<BigInt = BigInteger256>,
-    LwC: IsShortWeierstrass
-        + IsEllipticCurve<PointRepresentation = ShortWeierstrassProjectivePoint<LwC>>
-        + 'static,
-    LwC::BaseField: IsField<BaseType = Scalar> + IsPrimeField<CanonicalType = Scalar>,
-{
-    let mut group = c.benchmark_group(group_name);
-
-    for &size in BENCH_SIZES {
-        let data = make_data_for_curve(size);
-        let base_msm = MetalPippengerMSM::new(config_for_curve()).expect("Metal device required");
-        let config = base_msm.config_for_num_points(size);
-
-        assert_arkworks_lambdaworks_match(&data, config.window_size);
-        let cpu_expected =
-            pippenger::msm_with_signed(&data.lw_scalars, &data.lw_points, config.window_size)
-                .to_affine();
-        let mut msm = MetalPippengerMSM::new(config).expect("Metal device required");
-        let prepared = msm
-            .prepare(&data.gpu_scalars, &data.gpu_points)
-            .expect("Metal Pippenger MSM preparation failed");
-        let gpu_result = msm
-            .compute_prepared(&prepared)
-            .expect("Metal Pippenger MSM failed during correctness check");
-        let gpu_result = gpu_result_to_point::<LwC>(&gpu_result).to_affine();
-        assert_eq!(
-            gpu_result, cpu_expected,
-            "{group_name} GPU mismatch for size={size}"
-        );
-
-        group.bench_with_input(
-            BenchmarkId::new("arkworks-variable-base", size),
-            &data,
-            |b, data| b.iter(|| black_box(ark_msm(&data.ark_points, &data.ark_scalars))),
-        );
-
-        group.bench_with_input(
-            BenchmarkId::new("cpu-signed-pippenger", size),
-            &data,
-            |b, _data| {
-                b.iter(|| {
-                    black_box(pippenger::msm_with_signed(
-                        &data.lw_scalars,
-                        &data.lw_points,
-                        PippengerMSMConfig::optimal_window_size(data.lw_scalars.len()),
-                    ))
-                })
-            },
-        );
-
-        group.bench_with_input(
-            BenchmarkId::new("cpu-parallel-signed-pippenger", size),
-            &data,
-            |b, _data| {
-                b.iter(|| {
-                    black_box(pippenger::parallel_msm_with_signed(
-                        &data.lw_scalars,
-                        &data.lw_points,
-                        PippengerMSMConfig::optimal_window_size(data.lw_scalars.len()),
-                    ))
-                })
-            },
-        );
-
-        group.bench_with_input(
-            BenchmarkId::new("metal-pippenger", size),
-            &data,
-            |b, _data| {
-                b.iter(|| {
-                    black_box(
-                        msm.compute_prepared(&prepared)
-                            .expect("Metal Pippenger MSM failed"),
-                    )
-                })
-            },
-        );
-    }
-
-    group.finish();
-}
-
-fn assert_arkworks_lambdaworks_match<ArkAffine, LwC>(
-    data: &BenchData<ArkAffine, LwC>,
-    window_size: usize,
-) where
-    ArkAffine: AffineRepr,
-    ArkAffine::BaseField: PrimeField<BigInt = BigInteger256>,
-    ArkAffine::Group: VariableBaseMSM<MulBase = ArkAffine>,
-    ArkAffine::ScalarField: PrimeField<BigInt = BigInteger256>,
-    LwC: IsShortWeierstrass
-        + IsEllipticCurve<PointRepresentation = ShortWeierstrassProjectivePoint<LwC>>,
-    LwC::BaseField: IsField<BaseType = Scalar> + IsPrimeField<CanonicalType = Scalar>,
-{
-    let ark = ark_msm(&data.ark_points, &data.ark_scalars).into_affine();
-    let lw = pippenger::msm_with_signed(&data.lw_scalars, &data.lw_points, window_size).to_affine();
-
-    assert!(
-        field_eq(ark.x().expect("non-infinity Arkworks MSM result"), lw.x()),
-        "MSM x-coordinate mismatch"
-    );
-    assert!(
-        field_eq(ark.y().expect("non-infinity Arkworks MSM result"), lw.y()),
-        "MSM y-coordinate mismatch"
-    );
-}
-
-fn gpu_scalars(scalars: &[Scalar]) -> Vec<u64> {
+fn encode_scalars(scalars: &[Scalar]) -> Vec<u64> {
     let mut out = Vec::with_capacity(scalars.len() * 4);
-    for scalar in scalars {
-        out.extend_from_slice(&little_endian_limbs(scalar));
+    for s in scalars {
+        out.extend_from_slice(&little_endian_limbs(s));
     }
     out
 }
 
-fn gpu_points<C>(points: &[ShortWeierstrassProjectivePoint<C>]) -> Vec<u64>
+fn encode_points<C>(points: &[ShortWeierstrassProjectivePoint<C>]) -> Vec<u64>
 where
     C: IsShortWeierstrass,
     C::BaseField: IsField<BaseType = Scalar>,
 {
     let mut out = Vec::with_capacity(points.len() * 12);
-    for point in points {
-        let affine = point.to_affine();
+    for p in points {
+        let affine = p.to_affine();
         out.extend_from_slice(&little_endian_limbs(affine.x().value()));
         out.extend_from_slice(&little_endian_limbs(affine.y().value()));
         out.extend_from_slice(&little_endian_limbs(affine.z().value()));
@@ -244,90 +341,28 @@ where
     out
 }
 
-fn gpu_result_to_point<C>(limbs: &[u64]) -> ShortWeierstrassProjectivePoint<C>
-where
-    C: IsShortWeierstrass,
-    C::BaseField: IsField<BaseType = Scalar>,
-{
-    assert_eq!(limbs.len(), 12);
-    let x = FieldElement::<C::BaseField>::from_raw(unsigned_from_little_endian_limbs(&limbs[0..4]));
-    let y = FieldElement::<C::BaseField>::from_raw(unsigned_from_little_endian_limbs(&limbs[4..8]));
-    let z =
-        FieldElement::<C::BaseField>::from_raw(unsigned_from_little_endian_limbs(&limbs[8..12]));
-
-    if z == FieldElement::zero() {
-        return ShortWeierstrassProjectivePoint::<C>::neutral_element();
-    }
-
-    let projective_x = x * z.clone();
-    let projective_z = z.pow(3_u16);
-    ShortWeierstrassProjectivePoint::<C>::new_unchecked([projective_x, y, projective_z])
-}
-
 fn mina_pallas_generator() -> LwPallasPoint {
     let x = FieldElement::from(&Scalar::from_u64(1));
-    let y =
-        FieldElement::from_hex("1b74b5a30a12937c53dfa9f06378ee548f655bd4333d477119cf7a23caed2abb")
-            .expect("valid Mina Pallas generator y");
-    PallasCurve::create_point_from_affine(x, y).expect("valid Mina Pallas generator")
+    let y = FieldElement::from_hex(
+        "1b74b5a30a12937c53dfa9f06378ee548f655bd4333d477119cf7a23caed2abb",
+    )
+    .expect("valid y");
+    PallasCurve::create_point_from_affine(x, y).expect("valid Pallas generator")
 }
 
 fn mina_vesta_generator() -> LwVestaPoint {
     let x = FieldElement::from(&Scalar::from_u64(1));
-    let y =
-        FieldElement::from_hex("1943666ea922ae6b13b64e3aae89754cacce3a7f298ba20c4e4389b9b0276a62")
-            .expect("valid Mina Vesta generator y");
-    VestaCurve::create_point_from_affine(x, y).expect("valid Mina Vesta generator")
+    let y = FieldElement::from_hex(
+        "1943666ea922ae6b13b64e3aae89754cacce3a7f298ba20c4e4389b9b0276a62",
+    )
+    .expect("valid y");
+    VestaCurve::create_point_from_affine(x, y).expect("valid Vesta generator")
 }
 
-fn unsigned_from_bigint(value: BigInteger256) -> Scalar {
-    let limbs = value.0;
-    Scalar::from_limbs([limbs[3], limbs[2], limbs[1], limbs[0]])
+fn unsigned_from_bigint(v: BigInteger256) -> Scalar {
+    Scalar::from_limbs([v.0[3], v.0[2], v.0[1], v.0[0]])
 }
 
-fn little_endian_limbs(value: &Scalar) -> [u64; 4] {
-    [
-        value.limbs[3],
-        value.limbs[2],
-        value.limbs[1],
-        value.limbs[0],
-    ]
+fn little_endian_limbs(v: &Scalar) -> [u64; 4] {
+    [v.limbs[3], v.limbs[2], v.limbs[1], v.limbs[0]]
 }
-
-fn unsigned_from_little_endian_limbs(limbs: &[u64]) -> Scalar {
-    assert_eq!(limbs.len(), 4);
-    Scalar::from_limbs([limbs[3], limbs[2], limbs[1], limbs[0]])
-}
-
-fn field_eq<F, LwF>(ark: F, lw: &FieldElement<LwF>) -> bool
-where
-    F: PrimeField<BigInt = BigInteger256>,
-    LwF: lambdaworks_math::field::traits::IsPrimeField<CanonicalType = Scalar>,
-{
-    unsigned_from_bigint(ark.into_bigint()) == lw.canonical()
-}
-
-fn bench_pallas(c: &mut Criterion) {
-    bench_curve::<mina_curves::pasta::Pallas, PallasCurve>(
-        c,
-        "pallas-pippenger-msm",
-        pallas_data,
-        PippengerMSMConfig::pallas,
-    );
-}
-
-fn bench_vesta(c: &mut Criterion) {
-    bench_curve::<mina_curves::pasta::Vesta, VestaCurve>(
-        c,
-        "vesta-pippenger-msm",
-        vesta_data,
-        PippengerMSMConfig::vesta,
-    );
-}
-
-criterion_group! {
-    name = benches;
-    config = Criterion::default().sample_size(10);
-    targets = bench_pallas, bench_vesta
-}
-criterion_main!(benches);

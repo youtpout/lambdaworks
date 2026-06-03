@@ -30,6 +30,9 @@ walkdir = { version = "2.3.3", optional = true }
 [features]
 cuda = ["dep:walkdir"]
 metal = ["dep:metal", "dep:objc", "dep:walkdir"]
+# ROCm/HIP backend for AMD GPUs.
+# Requires ROCm ≥ 5.0 installed (libamdhip64 + libhiprtc on the link path).
+rocm = []
 
 # Some features activate compilation of code which isn't
 # supported in all machines (e.g. metal, cuda), so we won't
@@ -39,7 +42,10 @@ metal = ["dep:metal", "dep:objc", "dep:walkdir"]
 # use `--no-default-features`.
 default = []
 
+# The bench conditionally includes Metal and/or ROCm sections via cfg(feature).
+# Activate at least one GPU backend to run it:
+#   cargo bench --features metal   (Apple)
+#   cargo bench --features rocm    (AMD)
 [[bench]]
 name = "pippenger_msm"
 harness = false
-required-features = ["metal"]

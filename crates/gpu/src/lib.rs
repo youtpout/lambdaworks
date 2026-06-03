@@ -3,3 +3,6 @@ pub mod cuda;
 
 #[cfg(feature = "metal")]
 pub mod metal;
+
+#[cfg(feature = "rocm")]
+pub mod rocm;
