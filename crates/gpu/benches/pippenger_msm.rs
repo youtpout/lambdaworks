@@ -15,6 +15,7 @@
 use ark_ec::{AffineRepr, CurveGroup, VariableBaseMSM};
 use ark_ff::{BigInteger256, PrimeField, UniformRand};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use std::time::Duration;
 use lambdaworks_math::{
     cyclic_group::IsGroup,
     elliptic_curve::{
@@ -39,7 +40,7 @@ use rand_chacha::ChaCha20Rng;
 use lambdaworks_gpu::metal::pippenger_msm::{MetalPippengerMSM, PippengerMSMConfig};
 
 #[cfg(feature = "rocm")]
-use lambdaworks_gpu::rocm::pippenger_msm::{HipPippengerMSM, HipPippengerMSMConfig};
+use lambdaworks_gpu::rocm::pippenger_msm::HipPippengerMSM;
 
 const SEED: [u8; 32] = [0x42; 32];
 const BENCH_SIZES: &[usize] = &[1 << 12, 1 << 18, 1 << 22];
@@ -132,20 +133,6 @@ fn bench_pallas(c: &mut Criterion) {
         );
 
         group.bench_with_input(
-            BenchmarkId::new("cpu-signed-pippenger", size),
-            &data,
-            |b, data| {
-                b.iter(|| {
-                    black_box(pippenger::msm_with_signed(
-                        &data.lw_scalars,
-                        &data.lw_points,
-                        window_size,
-                    ))
-                })
-            },
-        );
-
-        group.bench_with_input(
             BenchmarkId::new("cpu-parallel-signed-pippenger", size),
             &data,
             |b, data| {
@@ -219,20 +206,6 @@ fn bench_vesta(c: &mut Criterion) {
         );
 
         group.bench_with_input(
-            BenchmarkId::new("cpu-signed-pippenger", size),
-            &data,
-            |b, data| {
-                b.iter(|| {
-                    black_box(pippenger::msm_with_signed(
-                        &data.lw_scalars,
-                        &data.lw_points,
-                        window_size,
-                    ))
-                })
-            },
-        );
-
-        group.bench_with_input(
             BenchmarkId::new("cpu-parallel-signed-pippenger", size),
             &data,
             |b, data| {
@@ -292,7 +265,7 @@ fn bench_vesta(c: &mut Criterion) {
 
 criterion_group! {
     name = benches;
-    config = Criterion::default().sample_size(10);
+    config = Criterion::default().sample_size(10).warm_up_time(Duration::from_secs(1)).measurement_time(Duration::from_secs(10));
     targets = bench_pallas, bench_vesta
 }
 criterion_main!(benches);
