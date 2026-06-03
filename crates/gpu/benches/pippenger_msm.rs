@@ -125,9 +125,8 @@ fn bench_curve<ArkAffine, LwC>(
 
     for &size in BENCH_SIZES {
         let data = make_data_for_curve(size);
-        let mut config = config_for_curve();
-        config.window_size = PippengerMSMConfig::optimal_window_size(size);
-        config.chunk_size = 256;
+        let base_msm = MetalPippengerMSM::new(config_for_curve()).expect("Metal device required");
+        let config = base_msm.config_for_num_points(size);
 
         assert_arkworks_lambdaworks_match(&data, config.window_size);
         let cpu_expected =

@@ -96,6 +96,48 @@ impl PippengerMSMConfig {
 
     pub const MAX_WINDOW_SIZE: usize = 20;
 
+    /// Estimates the number of shader lanes (ALUs) on the Metal device by name.
+    ///
+    /// Apple Silicon GPU tiers (approximate shader lane counts):
+    /// - M1/M2/M3/M4 base: 8-10 cores × 128 = 1024–1280
+    /// - M1/M2/M3/M4 Pro: 16-20 cores × 128 = 2048–2560
+    /// - M1/M2/M3/M4 Max: 24-40 cores × 128 = 3072–5120
+    /// - M2/M3/M4 Ultra: 60-80 cores × 128 = 7680–10240
+    pub fn estimate_gpu_shader_lanes(device_name: &str) -> usize {
+        let name = device_name.to_lowercase();
+        if name.contains("m4 ultra") || name.contains("m3 ultra") || name.contains("m2 ultra") {
+            80 * 128 // 10240
+        } else if name.contains("m1 ultra") {
+            64 * 128 // 8192
+        } else if name.contains("m4 max") {
+            40 * 128 // 5120
+        } else if name.contains("m3 max") || name.contains("m2 max") || name.contains("m1 max") {
+            32 * 128 // 4096
+        } else if name.contains("m4 pro") || name.contains("m3 pro") || name.contains("m2 pro") {
+            20 * 128 // 2560
+        } else if name.contains("m1 pro") {
+            16 * 128 // 2048
+        } else {
+            10 * 128 // 1280 — M1/M2/M3/M4 base
+        }
+    }
+
+    /// Returns the optimal `chunk_size` for the given MSM size, targeting ~4× GPU occupancy.
+    ///
+    /// - `num_points`: number of scalars/points in the MSM
+    /// - `num_windows`: effective window count (from `PippengerMSMConfig`)
+    /// - `shader_lanes`: total GPU ALU count from `estimate_gpu_shader_lanes`
+    pub fn optimal_chunk_size(
+        num_points: usize,
+        num_windows: usize,
+        shader_lanes: usize,
+    ) -> usize {
+        let target_threads = shader_lanes * 4;
+        let target_chunks = (target_threads.max(num_windows)).div_ceil(num_windows);
+        let raw = num_points.div_ceil(target_chunks);
+        raw.max(16).next_power_of_two().min(num_points.next_power_of_two())
+    }
+
     fn validate(&self) {
         assert!(
             (1..=Self::MAX_WINDOW_SIZE).contains(&self.window_size),
@@ -139,6 +181,8 @@ pub struct MetalPippengerMSM {
     max_threads_clear: u64,
     max_threads_bucket_merge: u64,
     max_threads_reduction: u64,
+    /// Number of GPU shader lanes detected from the Metal device name.
+    pub shader_lanes: usize,
 }
 
 pub struct PreparedPippengerMSM {
@@ -160,6 +204,8 @@ pub struct PreparedPippengerMSM {
 impl MetalPippengerMSM {
     pub fn new(config: PippengerMSMConfig) -> MetalResult<Self> {
         let state = DynamicMetalState::new()?;
+        let shader_lanes =
+            PippengerMSMConfig::estimate_gpu_shader_lanes(state.device().name());
         Ok(Self {
             state,
             config,
@@ -168,7 +214,26 @@ impl MetalPippengerMSM {
             max_threads_clear: 0,
             max_threads_bucket_merge: 0,
             max_threads_reduction: 0,
+            shader_lanes,
         })
+    }
+
+    /// Returns the optimal `PippengerMSMConfig` for `num_points` on the detected GPU.
+    pub fn config_for_num_points(&self, num_points: usize) -> PippengerMSMConfig {
+        let window_size = PippengerMSMConfig::optimal_window_size(num_points);
+        let effective_windows = (self.config.scalar_limbs * self.config.bits_per_limb)
+            .div_ceil(window_size)
+            + 1;
+        let chunk_size = PippengerMSMConfig::optimal_chunk_size(
+            num_points,
+            effective_windows,
+            self.shader_lanes,
+        );
+        PippengerMSMConfig {
+            window_size,
+            chunk_size,
+            ..self.config.clone()
+        }
     }
 
     pub fn new_pallas() -> MetalResult<Self> {
