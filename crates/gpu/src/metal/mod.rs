@@ -32,3 +32,4 @@
 
 pub mod abstractions;
 pub mod msm;
+pub mod pippenger_msm;
