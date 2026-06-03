@@ -14,7 +14,10 @@ const PIPPENGER_MSM_HIP_SOURCE: &str =
 
 const COORD_LIMBS: usize = 4;
 const COORDS_PER_POINT: usize = 3;
+/// Limbs in a Jacobian bucket point (x,y,z — 12 u64s).
 const LIMBS_PER_POINT: usize = COORD_LIMBS * COORDS_PER_POINT;
+/// Limbs in an affine input point (x,y only — 8 u64s). Z is implicit (= mont_one).
+const LIMBS_PER_AFFINE: usize = COORD_LIMBS * 2;
 
 const PALLAS_MODULUS: [u64; COORD_LIMBS] = [
     0x992d30ed00000001,
@@ -64,12 +67,14 @@ impl HipPippengerMSMConfig {
     }
 
     pub fn optimal_window_size(num_points: usize) -> usize {
+        // Cap at 7 so num_buckets = 2^(w-1) ≤ 64, fitting in the fast register path.
+        // The medium shared-memory path handles up to 512 buckets (window ≤ 10) but
+        // requires per-thread bucket striping which scales poorly; register path is fastest.
         match num_points {
             0..=4 => 2,
             5..=32 => 4,
             33..=256 => 6,
-            257..=4096 => 7,
-            _ => 9,
+            _ => 7,
         }
     }
 
@@ -86,18 +91,20 @@ impl HipPippengerMSMConfig {
     }
 
     /// Optimal chunk size for `num_points`, targeting ~4× GPU occupancy.
+    ///
+    /// Each MSM's partial_buckets = num_windows × num_chunks × num_buckets × 96 bytes.
+    /// With window=7 (num_buckets=64) this stays well under 100 MB per MSM.
     pub fn optimal_chunk_size(
         num_points: usize,
         num_windows: usize,
         cu_count: usize,
     ) -> usize {
-        // Assume 64 threads per CU (conservative for AMD RDNA/CDNA wavefronts).
+        // Target ~4× over-subscription relative to CU count.
+        // Assume 64 threads/CU wavefront (conservative for RDNA/CDNA).
         let target_threads = cu_count * 64 * 4;
-        let target_chunks = (target_threads.max(num_windows)).div_ceil(num_windows);
+        let target_chunks = target_threads.div_ceil(num_windows);
         let raw = num_points.div_ceil(target_chunks);
-        raw.max(16)
-            .next_power_of_two()
-            .min(num_points.next_power_of_two())
+        raw.max(16).next_power_of_two()
     }
 
     fn validate(&self) {
@@ -225,15 +232,15 @@ impl HipPippengerMSM {
                 actual: scalars.len(),
             });
         }
-        if points.len() % LIMBS_PER_POINT != 0 {
+        if points.len() % LIMBS_PER_AFFINE != 0 {
             return Err(HipError::InvalidInputSize {
-                expected: LIMBS_PER_POINT,
+                expected: LIMBS_PER_AFFINE,
                 actual: points.len(),
             });
         }
 
         let num_scalars = scalars.len() / self.config.scalar_limbs;
-        let num_points = points.len() / LIMBS_PER_POINT;
+        let num_points = points.len() / LIMBS_PER_AFFINE;
         if num_scalars != num_points {
             return Err(HipError::LengthMismatch(num_scalars, num_points));
         }
@@ -317,7 +324,7 @@ impl HipPippengerMSM {
 
         // Validate and determine per-MSM sizes from the first entry.
         let num_scalars = batch[0].0.len() / self.config.scalar_limbs;
-        let num_points  = batch[0].1.len() / LIMBS_PER_POINT;
+        let num_points  = batch[0].1.len() / LIMBS_PER_AFFINE;
         if num_scalars != num_points || num_scalars == 0 {
             return Err(HipError::LengthMismatch(num_scalars, num_points));
         }
@@ -471,9 +478,12 @@ impl HipPippengerMSM {
     // ─── private helpers ──────────────────────────────────────────────────
 
     fn field_params_buffer(&self) -> HipResult<DeviceBuffer> {
-        let mut params = [0u64; COORD_LIMBS + 1];
+        // Layout: [modulus(4), inv(1), mont_one(4)] = 9 u64s.
+        let mut params = [0u64; COORD_LIMBS + 1 + COORD_LIMBS];
         params[..COORD_LIMBS].copy_from_slice(&self.config.field_modulus);
         params[COORD_LIMBS] = self.config.montgomery_inv;
+        let mont_one = compute_mont_one(&self.config.field_modulus);
+        params[COORD_LIMBS + 1..].copy_from_slice(&mont_one);
         self.state.alloc_buffer_with_data(&params)
     }
 
@@ -754,6 +764,34 @@ fn mont_mul(a: &[u64; COORD_LIMBS], b: &[u64; COORD_LIMBS], f: &FieldParams) -> 
 
 fn mont_square(a: &[u64; COORD_LIMBS], f: &FieldParams) -> [u64; COORD_LIMBS] {
     mont_mul(a, a, f)
+}
+
+/// Compute R = 2^256 mod modulus (the Montgomery representation of 1).
+///
+/// Uses 256 modular doublings starting from 1.  Called once at init time —
+/// cost is negligible.  Limbs are in little-endian order (limb[0] = LSW).
+fn compute_mont_one(modulus: &[u64; COORD_LIMBS]) -> [u64; COORD_LIMBS] {
+    let mut r = [1u64, 0, 0, 0]; // 1 in LE
+    for _ in 0..256 {
+        let mut carry = 0u64;
+        let mut doubled = [0u64; COORD_LIMBS];
+        for i in 0..COORD_LIMBS {
+            let (a, c1) = r[i].overflowing_add(r[i]);
+            let (b, c2) = a.overflowing_add(carry);
+            doubled[i] = b;
+            carry = u64::from(c1) + u64::from(c2);
+        }
+        let mut borrow = 0u64;
+        let mut sub = [0u64; COORD_LIMBS];
+        for i in 0..COORD_LIMBS {
+            let (d, b1) = doubled[i].overflowing_sub(modulus[i]);
+            let (e, b2) = d.overflowing_sub(borrow);
+            sub[i] = e;
+            borrow = u64::from(b1) + u64::from(b2);
+        }
+        r = if carry != 0 || borrow == 0 { sub } else { doubled };
+    }
+    r
 }
 
 fn montgomery_inv64(m0: u64) -> u64 {

@@ -158,12 +158,12 @@ where
     C: IsShortWeierstrass,
     C::BaseField: IsField<BaseType = Scalar>,
 {
-    let mut out = Vec::with_capacity(points.len() * 12);
+    let mut out = Vec::with_capacity(points.len() * 8);
     for p in points {
         let a = p.to_affine();
         out.extend_from_slice(&le_limbs(a.x().value()));
         out.extend_from_slice(&le_limbs(a.y().value()));
-        out.extend_from_slice(&le_limbs(a.z().value()));
+        // z is implicit (mont_one) — not sent to the GPU
     }
     out
 }

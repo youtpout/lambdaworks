@@ -304,12 +304,12 @@ where
     C: IsShortWeierstrass,
     C::BaseField: IsField<BaseType = Scalar>,
 {
-    let mut out = Vec::with_capacity(points.len() * 12);
+    let mut out = Vec::with_capacity(points.len() * 8);
     for p in points {
         let affine = p.to_affine();
         out.extend_from_slice(&little_endian_limbs(affine.x().value()));
         out.extend_from_slice(&little_endian_limbs(affine.y().value()));
-        out.extend_from_slice(&little_endian_limbs(affine.z().value()));
+        // z is implicit (mont_one) — not sent to the GPU
     }
     out
 }

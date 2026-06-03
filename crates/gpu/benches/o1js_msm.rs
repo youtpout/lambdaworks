@@ -129,31 +129,31 @@ fn encode_scalars(scalars: &[Scalar]) -> Vec<u64> {
 }
 
 fn encode_points_pallas(points: &[ShortWeierstrassProjectivePoint<PallasCurve>]) -> Vec<u64> {
-    let mut out = Vec::with_capacity(points.len() * 12);
+    let mut out = Vec::with_capacity(points.len() * 8);
     for p in points {
         let a = p.to_affine();
         out.extend_from_slice(&le_limbs(a.x().value()));
         out.extend_from_slice(&le_limbs(a.y().value()));
-        out.extend_from_slice(&le_limbs(a.z().value()));
     }
     out
 }
 
 fn encode_points_vesta(points: &[ShortWeierstrassProjectivePoint<VestaCurve>]) -> Vec<u64> {
-    let mut out = Vec::with_capacity(points.len() * 12);
+    let mut out = Vec::with_capacity(points.len() * 8);
     for p in points {
         let a = p.to_affine();
         out.extend_from_slice(&le_limbs(a.x().value()));
         out.extend_from_slice(&le_limbs(a.y().value()));
-        out.extend_from_slice(&le_limbs(a.z().value()));
     }
     out
 }
 
 fn window(n: usize) -> usize {
     match n {
-        0..=4096 => 7,
-        _ => 9,
+        0..=4 => 2,
+        5..=32 => 4,
+        33..=256 => 6,
+        _ => 7,
     }
 }
 
