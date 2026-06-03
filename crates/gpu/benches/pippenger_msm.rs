@@ -127,15 +127,18 @@ fn bench_curve<ArkAffine, LwC>(
         let data = make_data_for_curve(size);
         let mut config = config_for_curve();
         config.window_size = PippengerMSMConfig::optimal_window_size(size);
-        config.chunk_size = 1024;
+        config.chunk_size = 256;
 
         assert_arkworks_lambdaworks_match(&data, config.window_size);
         let cpu_expected =
             pippenger::msm_with_signed(&data.lw_scalars, &data.lw_points, config.window_size)
                 .to_affine();
         let mut msm = MetalPippengerMSM::new(config).expect("Metal device required");
+        let prepared = msm
+            .prepare(&data.gpu_scalars, &data.gpu_points)
+            .expect("Metal Pippenger MSM preparation failed");
         let gpu_result = msm
-            .compute(&data.gpu_scalars, &data.gpu_points)
+            .compute_prepared(&prepared)
             .expect("Metal Pippenger MSM failed during correctness check");
         let gpu_result = gpu_result_to_point::<LwC>(&gpu_result).to_affine();
         assert_eq!(
@@ -152,7 +155,7 @@ fn bench_curve<ArkAffine, LwC>(
         group.bench_with_input(
             BenchmarkId::new("cpu-signed-pippenger", size),
             &data,
-            |b, data| {
+            |b, _data| {
                 b.iter(|| {
                     black_box(pippenger::msm_with_signed(
                         &data.lw_scalars,
@@ -166,7 +169,7 @@ fn bench_curve<ArkAffine, LwC>(
         group.bench_with_input(
             BenchmarkId::new("cpu-parallel-signed-pippenger", size),
             &data,
-            |b, data| {
+            |b, _data| {
                 b.iter(|| {
                     black_box(pippenger::parallel_msm_with_signed(
                         &data.lw_scalars,
@@ -180,10 +183,10 @@ fn bench_curve<ArkAffine, LwC>(
         group.bench_with_input(
             BenchmarkId::new("metal-pippenger", size),
             &data,
-            |b, data| {
+            |b, _data| {
                 b.iter(|| {
                     black_box(
-                        msm.compute(&data.gpu_scalars, &data.gpu_points)
+                        msm.compute_prepared(&prepared)
                             .expect("Metal Pippenger MSM failed"),
                     )
                 })

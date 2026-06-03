@@ -4,6 +4,7 @@ using namespace metal;
 constant uint NUM_LIMBS = 4;
 constant uint COORDS_PER_POINT = 3;
 constant uint LIMBS_PER_POINT = NUM_LIMBS * COORDS_PER_POINT;
+constant uint MAX_PRIVATE_BUCKETS = 64;
 
 struct BigInt {
     ulong limbs[NUM_LIMBS];
@@ -259,6 +260,44 @@ JacobianPoint jacobian_add(JacobianPoint p, JacobianPoint q, FieldParams field) 
     return result;
 }
 
+JacobianPoint jacobian_add_mixed(JacobianPoint p, JacobianPoint q, FieldParams field) {
+    if (jacobian_is_identity(p)) {
+        return q;
+    }
+    if (jacobian_is_identity(q)) {
+        return p;
+    }
+
+    BigInt Z1Z1 = mont_square(p.z, field);
+    BigInt U1 = p.x;
+    BigInt U2 = mont_mul(q.x, Z1Z1, field);
+    BigInt S1 = p.y;
+    BigInt S2 = mont_mul(mont_mul(q.y, p.z, field), Z1Z1, field);
+    BigInt H = field_sub(U2, U1, field);
+
+    if (bigint_is_zero(H)) {
+        if (bigint_is_zero(field_sub(S2, S1, field))) {
+            return jacobian_double(p, field);
+        }
+        return jacobian_identity();
+    }
+
+    BigInt HH = mont_square(H, field);
+    BigInt HHH = mont_mul(H, HH, field);
+    BigInt r = field_sub(S2, S1, field);
+    BigInt V = mont_mul(U1, HH, field);
+
+    JacobianPoint result;
+    result.x = field_sub(field_sub(mont_square(r, field), HHH, field), field_double(V, field), field);
+    result.y = field_sub(
+        mont_mul(r, field_sub(V, result.x, field), field),
+        mont_mul(S1, HHH, field),
+        field
+    );
+    result.z = mont_mul(p.z, H, field);
+    return result;
+}
+
 JacobianPoint jacobian_neg(JacobianPoint p, FieldParams field) {
     p.y = field_neg(p.y, field);
     return p;
@@ -281,6 +320,17 @@ void store_point(device ulong* points, uint point_idx, JacobianPoint p) {
         points[base + i] = p.x.limbs[i];
         points[base + NUM_LIMBS + i] = p.y.limbs[i];
         points[base + 2 * NUM_LIMBS + i] = p.z.limbs[i];
+    }
+}
+
+kernel void clear_u64_buffer(
+    device ulong* buffer [[buffer(0)]],
+    device const uint* config [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint len = config[0];
+    if (gid < len) {
+        buffer[gid] = 0;
     }
 }
 
@@ -310,8 +360,31 @@ kernel void bucket_accumulation_by_chunk(
     uint partial_base = (window_idx * num_chunks + chunk_idx) * num_buckets;
     FieldParams field = load_field(field_params);
 
-    for (uint bucket_idx = 0; bucket_idx < num_buckets; bucket_idx++) {
-        store_point(partial_buckets, partial_base + bucket_idx, jacobian_identity());
+    if (num_buckets <= MAX_PRIVATE_BUCKETS) {
+        JacobianPoint local_buckets[MAX_PRIVATE_BUCKETS];
+        for (uint bucket_idx = 0; bucket_idx < num_buckets; bucket_idx++) {
+            local_buckets[bucket_idx] = jacobian_identity();
+        }
+
+        for (uint scalar_idx = start; scalar_idx < end; scalar_idx++) {
+            int digit = digits[scalar_idx * num_windows + window_idx];
+            if (digit == 0) {
+                continue;
+            }
+
+            uint bucket_idx = digit > 0 ? uint(digit - 1) : uint(-digit - 1);
+            JacobianPoint p = load_point(points, scalar_idx);
+            if (digit < 0) {
+                p = jacobian_neg(p, field);
+            }
+
+            local_buckets[bucket_idx] = jacobian_add(local_buckets[bucket_idx], p, field);
+        }
+
+        for (uint bucket_idx = 0; bucket_idx < num_buckets; bucket_idx++) {
+            store_point(partial_buckets, partial_base + bucket_idx, local_buckets[bucket_idx]);
+        }
+        return;
     }
 
     for (uint scalar_idx = start; scalar_idx < end; scalar_idx++) {

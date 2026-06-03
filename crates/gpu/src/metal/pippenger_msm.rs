@@ -68,7 +68,7 @@ impl PippengerMSMConfig {
             bits_per_limb: 64,
             montgomery_inv: montgomery_inv64(field_modulus[0]),
             field_modulus,
-            chunk_size: 1024,
+            chunk_size: 256,
         }
     }
 
@@ -80,9 +80,8 @@ impl PippengerMSMConfig {
             33..=128 => 6,
             129..=1024 => 8,
             1025..=4096 => 8,
-            4097..=16384 => 9,
-            16385..=65536 => 10,
-            _ => 11,
+            4097..=65536 => 8,
+            _ => 9,
         }
     }
 
@@ -128,8 +127,27 @@ pub struct MetalPippengerMSM {
     config: PippengerMSMConfig,
     initialized: bool,
     max_threads_accumulation: u64,
+    max_threads_clear: u64,
     max_threads_bucket_merge: u64,
     max_threads_reduction: u64,
+}
+
+pub struct PreparedPippengerMSM {
+    digits_buffer: Buffer,
+    points_buffer: Buffer,
+    partial_buckets_buffer: Buffer,
+    buckets_buffer: Buffer,
+    window_sums_buffer: Buffer,
+    accumulation_config_buffer: Buffer,
+    merge_config_buffer: Buffer,
+    reduction_config_buffer: Buffer,
+    field_buffer: Buffer,
+    clear_partial_config_buffer: Buffer,
+    clear_buckets_config_buffer: Buffer,
+    clear_window_sums_config_buffer: Buffer,
+    accumulation_threads: u64,
+    merge_threads: u64,
+    effective_windows: usize,
 }
 
 impl MetalPippengerMSM {
@@ -140,6 +158,7 @@ impl MetalPippengerMSM {
             config,
             initialized: false,
             max_threads_accumulation: 0,
+            max_threads_clear: 0,
             max_threads_bucket_merge: 0,
             max_threads_reduction: 0,
         })
@@ -162,6 +181,7 @@ impl MetalPippengerMSM {
         self.max_threads_accumulation = self
             .state
             .prepare_pipeline("bucket_accumulation_by_chunk")?;
+        self.max_threads_clear = self.state.prepare_pipeline("clear_u64_buffer")?;
         self.max_threads_bucket_merge = self.state.prepare_pipeline("bucket_merge")?;
         self.max_threads_reduction = self.state.prepare_pipeline("bucket_reduction")?;
         self.initialized = true;
@@ -181,6 +201,15 @@ impl MetalPippengerMSM {
     /// `scalars` is `[s0_l0, ..., s0_l3, s1_l0, ...]`.
     /// `points` is `[x0_l0..x0_l3, y0_l0..y0_l3, z0_l0..z0_l3, x1_l0..]`.
     pub fn compute(&mut self, scalars: &[u64], points: &[u64]) -> MetalResult<Vec<u64>> {
+        let prepared = self.prepare(scalars, points)?;
+        self.compute_prepared(&prepared)
+    }
+
+    pub fn prepare(
+        &mut self,
+        scalars: &[u64],
+        points: &[u64],
+    ) -> MetalResult<PreparedPippengerMSM> {
         if !self.initialized {
             self.initialize()?;
         }
@@ -219,46 +248,85 @@ impl MetalPippengerMSM {
             .state
             .alloc_buffer(partial_buckets_len * std::mem::size_of::<u64>())?;
 
-        self.run_bucket_accumulation(
-            &digits_buffer,
-            &points_buffer,
-            &partial_buckets_buffer,
-            num_scalars,
-            effective_windows,
-            num_buckets,
-            num_chunks,
-        )?;
-
         let buckets_len = effective_windows * num_buckets * LIMBS_PER_POINT;
         let buckets_buffer = self
             .state
             .alloc_buffer(buckets_len * std::mem::size_of::<u64>())?;
 
-        self.run_bucket_merge(
-            &partial_buckets_buffer,
-            &buckets_buffer,
-            effective_windows,
-            num_buckets,
-            num_chunks,
-        )?;
-
         let window_sums_buffer = self
             .state
             .alloc_buffer(effective_windows * LIMBS_PER_POINT * std::mem::size_of::<u64>())?;
 
-        self.run_bucket_reduction(
-            &buckets_buffer,
-            &window_sums_buffer,
+        let accumulation_config_buffer = self.state.alloc_buffer_with_data(&[
+            num_scalars as u32,
+            effective_windows as u32,
+            num_buckets as u32,
+            self.config.chunk_size as u32,
+            num_chunks as u32,
+        ])?;
+        let merge_config_buffer = self.state.alloc_buffer_with_data(&[
+            effective_windows as u32,
+            num_buckets as u32,
+            num_chunks as u32,
+        ])?;
+        let reduction_config_buffer = self
+            .state
+            .alloc_buffer_with_data(&[effective_windows as u32, num_buckets as u32])?;
+        let field_buffer = self.field_params_buffer()?;
+        let clear_partial_config_buffer = self
+            .state
+            .alloc_buffer_with_data(&[partial_buckets_len as u32])?;
+        let clear_buckets_config_buffer =
+            self.state.alloc_buffer_with_data(&[buckets_len as u32])?;
+        let clear_window_sums_config_buffer = self
+            .state
+            .alloc_buffer_with_data(&[(effective_windows * LIMBS_PER_POINT) as u32])?;
+
+        Ok(PreparedPippengerMSM {
+            digits_buffer,
+            points_buffer,
+            partial_buckets_buffer,
+            buckets_buffer,
+            window_sums_buffer,
+            accumulation_config_buffer,
+            merge_config_buffer,
+            reduction_config_buffer,
+            field_buffer,
+            clear_partial_config_buffer,
+            clear_buckets_config_buffer,
+            clear_window_sums_config_buffer,
+            accumulation_threads: (effective_windows * num_chunks) as u64,
+            merge_threads: (effective_windows * num_buckets) as u64,
             effective_windows,
-            num_buckets,
+        })
+    }
+
+    pub fn compute_prepared(&self, prepared: &PreparedPippengerMSM) -> MetalResult<Vec<u64>> {
+        self.run_clear_u64_buffer_with_config(
+            &prepared.partial_buckets_buffer,
+            &prepared.clear_partial_config_buffer,
+        )?;
+        self.run_clear_u64_buffer_with_config(
+            &prepared.buckets_buffer,
+            &prepared.clear_buckets_config_buffer,
+        )?;
+        self.run_clear_u64_buffer_with_config(
+            &prepared.window_sums_buffer,
+            &prepared.clear_window_sums_config_buffer,
         )?;
 
+        self.run_bucket_accumulation_prepared(prepared)?;
+        self.run_bucket_merge_prepared(prepared)?;
+        self.run_bucket_reduction_prepared(prepared)?;
+
         let window_sums = unsafe {
-            self.state
-                .read_buffer::<u64>(&window_sums_buffer, effective_windows * LIMBS_PER_POINT)
+            self.state.read_buffer::<u64>(
+                &prepared.window_sums_buffer,
+                prepared.effective_windows * LIMBS_PER_POINT,
+            )
         };
 
-        Ok(self.combine_windows(&window_sums, effective_windows))
+        Ok(self.combine_windows(&window_sums, prepared.effective_windows))
     }
 }
 
@@ -314,87 +382,58 @@ fn recode_scalars_signed(
 }
 
 impl MetalPippengerMSM {
-    fn run_bucket_accumulation(
+    fn run_clear_u64_buffer_with_config(
         &self,
-        digits_buffer: &Buffer,
-        points_buffer: &Buffer,
-        partial_buckets_buffer: &Buffer,
-        num_scalars: usize,
-        num_windows: usize,
-        num_buckets: usize,
-        num_chunks: usize,
+        buffer: &Buffer,
+        config_buffer: &Buffer,
     ) -> MetalResult<()> {
-        let config_data = [
-            num_scalars as u32,
-            num_windows as u32,
-            num_buckets as u32,
-            self.config.chunk_size as u32,
-            num_chunks as u32,
-        ];
-        let config_buffer = self.state.alloc_buffer_with_data(&config_data)?;
-        let field_buffer = self.field_params_buffer()?;
-        let total_threads = (num_windows * num_chunks) as u64;
+        self.state.execute_compute(
+            "clear_u64_buffer",
+            &[buffer, config_buffer],
+            buffer.length() / std::mem::size_of::<u64>() as u64,
+            self.max_threads_clear,
+        )
+    }
 
+    fn run_bucket_accumulation_prepared(&self, prepared: &PreparedPippengerMSM) -> MetalResult<()> {
         self.state.execute_compute(
             "bucket_accumulation_by_chunk",
             &[
-                digits_buffer,
-                points_buffer,
-                partial_buckets_buffer,
-                &config_buffer,
-                &field_buffer,
+                &prepared.digits_buffer,
+                &prepared.points_buffer,
+                &prepared.partial_buckets_buffer,
+                &prepared.accumulation_config_buffer,
+                &prepared.field_buffer,
             ],
-            total_threads,
+            prepared.accumulation_threads,
             self.max_threads_accumulation,
         )
     }
 
-    fn run_bucket_merge(
-        &self,
-        partial_buckets_buffer: &Buffer,
-        buckets_buffer: &Buffer,
-        num_windows: usize,
-        num_buckets: usize,
-        num_chunks: usize,
-    ) -> MetalResult<()> {
-        let config_data = [num_windows as u32, num_buckets as u32, num_chunks as u32];
-        let config_buffer = self.state.alloc_buffer_with_data(&config_data)?;
-        let field_buffer = self.field_params_buffer()?;
-        let total_threads = (num_windows * num_buckets) as u64;
-
+    fn run_bucket_merge_prepared(&self, prepared: &PreparedPippengerMSM) -> MetalResult<()> {
         self.state.execute_compute(
             "bucket_merge",
             &[
-                partial_buckets_buffer,
-                buckets_buffer,
-                &config_buffer,
-                &field_buffer,
+                &prepared.partial_buckets_buffer,
+                &prepared.buckets_buffer,
+                &prepared.merge_config_buffer,
+                &prepared.field_buffer,
             ],
-            total_threads,
+            prepared.merge_threads,
             self.max_threads_bucket_merge,
         )
     }
 
-    fn run_bucket_reduction(
-        &self,
-        buckets_buffer: &Buffer,
-        window_sums_buffer: &Buffer,
-        num_windows: usize,
-        num_buckets: usize,
-    ) -> MetalResult<()> {
-        let config_data = [num_windows as u32, num_buckets as u32];
-        let config_buffer = self.state.alloc_buffer_with_data(&config_data)?;
-        let field_buffer = self.field_params_buffer()?;
-
+    fn run_bucket_reduction_prepared(&self, prepared: &PreparedPippengerMSM) -> MetalResult<()> {
         self.state.execute_compute(
             "bucket_reduction",
             &[
-                buckets_buffer,
-                window_sums_buffer,
-                &config_buffer,
-                &field_buffer,
+                &prepared.buckets_buffer,
+                &prepared.window_sums_buffer,
+                &prepared.reduction_config_buffer,
+                &prepared.field_buffer,
             ],
-            num_windows as u64,
+            prepared.effective_windows as u64,
             self.max_threads_reduction,
         )
     }
