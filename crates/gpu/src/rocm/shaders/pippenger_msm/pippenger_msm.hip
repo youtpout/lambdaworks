@@ -9,6 +9,9 @@
 //   bucket_merge               – merge per-chunk partial buckets
 //   bucket_reduction           – triangle sum reduction per window
 //
+// Batch MSM: blockIdx.y selects the MSM within a batch.
+// Single-MSM callers launch with grid_dim_y = 1 (blockIdx.y = 0, zero offset).
+//
 // Build with hipcc or consumed at runtime by hipRTC.
 
 #define NUM_LIMBS 4
@@ -287,17 +290,19 @@ __device__ JacobianPoint load_point(const u64limb* __restrict__ points, uint poi
 __device__ void store_point(u64limb* points, uint point_idx, JacobianPoint p) {
     uint base = point_idx * LIMBS_PER_POINT;
     for (uint i = 0; i < NUM_LIMBS; i++) {
-        points[base + i]                = p.x.limbs[i];
-        points[base + NUM_LIMBS + i]    = p.y.limbs[i];
+        points[base + i]                 = p.x.limbs[i];
+        points[base + NUM_LIMBS + i]     = p.y.limbs[i];
         points[base + 2 * NUM_LIMBS + i] = p.z.limbs[i];
     }
 }
 
 // ─── kernels ─────────────────────────────────────────────────────────────────
+//
+// blockIdx.y = MSM index within a batch.  Single-MSM callers set grid_dim_y=1.
 
 extern "C" __global__ void clear_u64_buffer(
-    u64limb* __restrict__ buffer,
-    const uint* __restrict__ config
+    u64limb*      __restrict__ buffer,
+    const uint*   __restrict__ config
 ) {
     uint gid = blockIdx.x * blockDim.x + threadIdx.x;
     uint len = config[0];
@@ -305,13 +310,14 @@ extern "C" __global__ void clear_u64_buffer(
 }
 
 extern "C" __global__ void bucket_accumulation_by_chunk(
-    const int*   __restrict__ digits,
+    const int*     __restrict__ digits,
     const u64limb* __restrict__ points,
     u64limb*       __restrict__ partial_buckets,
-    const uint*  __restrict__ config,
+    const uint*    __restrict__ config,
     const u64limb* __restrict__ field_params
 ) {
     uint gid         = blockIdx.x * blockDim.x + threadIdx.x;
+    uint msm_idx     = blockIdx.y;
     uint num_scalars = config[0];
     uint num_windows = config[1];
     uint num_buckets = config[2];
@@ -321,24 +327,28 @@ extern "C" __global__ void bucket_accumulation_by_chunk(
 
     if (gid >= total_workers) return;
 
-    uint window_idx  = gid / num_chunks;
-    uint chunk_idx   = gid % num_chunks;
-    uint start       = chunk_idx * chunk_size;
-    uint end         = (start + chunk_size < num_scalars) ? (start + chunk_size) : num_scalars;
-    uint partial_base = (window_idx * num_chunks + chunk_idx) * num_buckets;
+    uint window_idx = gid / num_chunks;
+    uint chunk_idx  = gid % num_chunks;
+    uint start      = chunk_idx * chunk_size;
+    uint end        = (start + chunk_size < num_scalars) ? (start + chunk_size) : num_scalars;
+
+    // Per-MSM offsets into the concatenated buffers.
+    uint msm_digits_off   = msm_idx * (num_scalars * num_windows);
+    uint msm_points_off   = msm_idx * (num_scalars);            // in point units
+    uint msm_partial_off  = msm_idx * (num_windows * num_chunks * num_buckets); // in point units
+    uint partial_base     = msm_partial_off + (window_idx * num_chunks + chunk_idx) * num_buckets;
 
     FieldParams field = load_field(field_params);
 
     if (num_buckets <= MAX_PRIVATE_BUCKETS) {
-        // Fast path: keep all buckets in registers / private memory.
         JacobianPoint local_buckets[MAX_PRIVATE_BUCKETS];
         for (uint b = 0; b < num_buckets; b++) local_buckets[b] = jacobian_identity();
 
         for (uint s = start; s < end; s++) {
-            int digit = digits[s * num_windows + window_idx];
+            int digit = digits[msm_digits_off + s * num_windows + window_idx];
             if (digit == 0) continue;
             uint bucket_idx = (digit > 0) ? (uint)(digit - 1) : (uint)(-digit - 1);
-            JacobianPoint p = load_point(points, s);
+            JacobianPoint p = load_point(points, msm_points_off + s);
             if (digit < 0) p = jacobian_neg(p, field);
             local_buckets[bucket_idx] = jacobian_add_mixed(local_buckets[bucket_idx], p, field);
         }
@@ -348,12 +358,12 @@ extern "C" __global__ void bucket_accumulation_by_chunk(
         return;
     }
 
-    // Slow path: buckets live in global memory (random-access).
+    // Slow path: buckets in global memory.
     for (uint s = start; s < end; s++) {
-        int digit = digits[s * num_windows + window_idx];
+        int digit = digits[msm_digits_off + s * num_windows + window_idx];
         if (digit == 0) continue;
         uint bucket_idx = (digit > 0) ? (uint)(digit - 1) : (uint)(-digit - 1);
-        JacobianPoint p = load_point(points, s);
+        JacobianPoint p = load_point(points, msm_points_off + s);
         if (digit < 0) p = jacobian_neg(p, field);
         uint partial_idx = partial_base + bucket_idx;
         JacobianPoint bucket = load_point(partial_buckets, partial_idx);
@@ -365,10 +375,11 @@ extern "C" __global__ void bucket_accumulation_by_chunk(
 extern "C" __global__ void bucket_merge(
     const u64limb* __restrict__ partial_buckets,
     u64limb*       __restrict__ buckets,
-    const uint*  __restrict__ config,
+    const uint*    __restrict__ config,
     const u64limb* __restrict__ field_params
 ) {
     uint gid         = blockIdx.x * blockDim.x + threadIdx.x;
+    uint msm_idx     = blockIdx.y;
     uint num_windows = config[0];
     uint num_buckets = config[1];
     uint num_chunks  = config[2];
@@ -378,40 +389,48 @@ extern "C" __global__ void bucket_merge(
 
     uint window_idx = gid / num_buckets;
     uint bucket_idx = gid % num_buckets;
+
+    uint msm_partial_off = msm_idx * (num_windows * num_chunks * num_buckets);
+    uint msm_buckets_off = msm_idx * (num_windows * num_buckets);
+
     FieldParams field = load_field(field_params);
     JacobianPoint bucket = jacobian_identity();
 
     for (uint c = 0; c < num_chunks; c++) {
-        uint partial_idx = (window_idx * num_chunks + c) * num_buckets + bucket_idx;
+        uint partial_idx = msm_partial_off + (window_idx * num_chunks + c) * num_buckets + bucket_idx;
         JacobianPoint partial = load_point(partial_buckets, partial_idx);
         bucket = jacobian_add(bucket, partial, field);
     }
 
-    store_point(buckets, gid, bucket);
+    store_point(buckets, msm_buckets_off + gid, bucket);
 }
 
 extern "C" __global__ void bucket_reduction(
     const u64limb* __restrict__ buckets,
     u64limb*       __restrict__ window_sums,
-    const uint*  __restrict__ config,
+    const uint*    __restrict__ config,
     const u64limb* __restrict__ field_params
 ) {
     uint window_idx  = blockIdx.x * blockDim.x + threadIdx.x;
+    uint msm_idx     = blockIdx.y;
     uint num_windows = config[0];
     uint num_buckets = config[1];
 
     if (window_idx >= num_windows) return;
 
+    uint msm_buckets_off = msm_idx * (num_windows * num_buckets);
+    uint msm_sums_off    = msm_idx * num_windows;
+
     FieldParams field = load_field(field_params);
-    uint bucket_base = window_idx * num_buckets;
+    uint bucket_base = msm_buckets_off + window_idx * num_buckets;
     JacobianPoint running_sum = jacobian_identity();
     JacobianPoint result      = jacobian_identity();
 
     for (int i = (int)num_buckets - 1; i >= 0; i--) {
-        JacobianPoint bucket = load_point(buckets, bucket_base + (uint)i);
-        running_sum = jacobian_add(running_sum, bucket, field);
+        JacobianPoint b = load_point(buckets, bucket_base + (uint)i);
+        running_sum = jacobian_add(running_sum, b, field);
         result      = jacobian_add(result, running_sum, field);
     }
 
-    store_point(window_sums, window_idx, result);
+    store_point(window_sums, msm_sums_off + window_idx, result);
 }

@@ -297,6 +297,124 @@ impl HipPippengerMSM {
         })
     }
 
+    /// Compute multiple MSMs in a single batched GPU kernel launch.
+    ///
+    /// All entries in `batch` must have the same number of points and use the
+    /// same curve (i.e. the same `config`).  Results are returned in the same
+    /// order as the input.
+    pub fn compute_batch(
+        &mut self,
+        batch: &[(&[u64], &[u64])],
+    ) -> HipResult<Vec<Vec<u64>>> {
+        if batch.is_empty() {
+            return Ok(vec![]);
+        }
+        if !self.initialized {
+            self.initialize()?;
+        }
+
+        let num_msms = batch.len();
+
+        // Validate and determine per-MSM sizes from the first entry.
+        let num_scalars = batch[0].0.len() / self.config.scalar_limbs;
+        let num_points  = batch[0].1.len() / LIMBS_PER_POINT;
+        if num_scalars != num_points || num_scalars == 0 {
+            return Err(HipError::LengthMismatch(num_scalars, num_points));
+        }
+
+        // Concatenate all scalars and points into single host buffers.
+        let total_scalars = batch[0].0.len() * num_msms;
+        let total_points  = batch[0].1.len() * num_msms;
+        let mut all_scalars_raw = Vec::with_capacity(total_scalars);
+        let mut all_points_raw  = Vec::with_capacity(total_points);
+        for (s, p) in batch {
+            all_scalars_raw.extend_from_slice(s);
+            all_points_raw.extend_from_slice(p);
+        }
+
+        // Recode all scalars (flat: [msm0_digits..., msm1_digits..., ...]).
+        let num_buckets     = self.config.num_buckets();
+        let effective_windows = self.config.num_windows() + 1;
+        let num_chunks      = num_scalars.div_ceil(self.config.chunk_size);
+
+        let mut all_digits = Vec::with_capacity(num_msms * num_scalars * effective_windows);
+        for i in 0..num_msms {
+            let scalar_slice = &all_scalars_raw[i * batch[0].0.len()..][..batch[0].0.len()];
+            let digits = recode_scalars_signed(&self.config, scalar_slice, num_scalars);
+            all_digits.extend_from_slice(&digits);
+        }
+
+        // Upload concatenated buffers.
+        let digits_buf = self.state.alloc_buffer_with_data(&all_digits)?;
+        let points_buf = self.state.alloc_buffer_with_data(&all_points_raw)?;
+
+        // Allocate batch-sized intermediate buffers.
+        let partial_len = num_msms * effective_windows * num_chunks * num_buckets * LIMBS_PER_POINT;
+        let partial_buckets_buf =
+            self.state.alloc_buffer(partial_len * std::mem::size_of::<u64>())?;
+        self.state.zero_buffer(&partial_buckets_buf)?;
+
+        let buckets_len = num_msms * effective_windows * num_buckets * LIMBS_PER_POINT;
+        let buckets_buf =
+            self.state.alloc_buffer(buckets_len * std::mem::size_of::<u64>())?;
+
+        let window_sums_buf = self.state.alloc_buffer(
+            num_msms * effective_windows * LIMBS_PER_POINT * std::mem::size_of::<u64>(),
+        )?;
+
+        // Config buffers (same as single-MSM — per-MSM sizes, shared across all).
+        let accum_config_buf = self.state.alloc_buffer_with_data(&[
+            num_scalars as u32,
+            effective_windows as u32,
+            num_buckets as u32,
+            self.config.chunk_size as u32,
+            num_chunks as u32,
+        ])?;
+        let merge_config_buf = self.state.alloc_buffer_with_data(&[
+            effective_windows as u32,
+            num_buckets as u32,
+            num_chunks as u32,
+        ])?;
+        let reduction_config_buf = self
+            .state
+            .alloc_buffer_with_data(&[effective_windows as u32, num_buckets as u32])?;
+        let field_buf = self.field_params_buffer()?;
+
+        let accum_bufs: &[&DeviceBuffer] = &[
+            &digits_buf, &points_buf, &partial_buckets_buf, &accum_config_buf, &field_buf,
+        ];
+        let merge_bufs: &[&DeviceBuffer] = &[
+            &partial_buckets_buf, &buckets_buf, &merge_config_buf, &field_buf,
+        ];
+        let reduc_bufs: &[&DeviceBuffer] = &[
+            &buckets_buf, &window_sums_buf, &reduction_config_buf, &field_buf,
+        ];
+
+        self.state.execute_compute_seq_2d(
+            &[
+                ("bucket_accumulation_by_chunk", accum_bufs, (effective_windows * num_chunks) as u64),
+                ("bucket_merge",                 merge_bufs, (effective_windows * num_buckets) as u64),
+                ("bucket_reduction",             reduc_bufs, effective_windows as u64),
+            ],
+            num_msms as u32,
+        )?;
+
+        // Read back all window sums and combine on CPU.
+        let all_sums: Vec<u64> = self.state.read_buffer(
+            &window_sums_buf,
+            num_msms * effective_windows * LIMBS_PER_POINT,
+        )?;
+
+        let results = (0..num_msms)
+            .map(|i| {
+                let base = i * effective_windows * LIMBS_PER_POINT;
+                self.combine_windows(&all_sums[base..base + effective_windows * LIMBS_PER_POINT], effective_windows)
+            })
+            .collect();
+
+        Ok(results)
+    }
+
     pub fn compute_prepared(
         &mut self,
         prepared: &PreparedHipPippengerMSM,

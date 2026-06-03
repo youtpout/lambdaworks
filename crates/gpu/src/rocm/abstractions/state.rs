@@ -339,11 +339,22 @@ impl HipState {
         &mut self,
         kernels: &[(&str, &[&DeviceBuffer], u64)],
     ) -> HipResult<()> {
+        self.execute_compute_seq_2d(kernels, 1)
+    }
+
+    /// Like `execute_compute_seq` but with a 2-D grid: `grid_dim_x × grid_y`.
+    ///
+    /// `grid_y` is applied uniformly to every kernel in the sequence.
+    /// Use `grid_y = 1` for the single-MSM (non-batched) path.
+    pub fn execute_compute_seq_2d(
+        &mut self,
+        kernels: &[(&str, &[&DeviceBuffer], u64)],
+        grid_y: u32,
+    ) -> HipResult<()> {
         for (name, buffers, thread_count) in kernels {
             let func = self.get_function(name)?;
             let block_size: u32 = 256;
-            let grid_size: u32 =
-                ((*thread_count as u32) + block_size - 1) / block_size;
+            let grid_x: u32 = ((*thread_count as u32) + block_size - 1) / block_size;
 
             // Build the kernel-params array: one void* per buffer (device ptr).
             let mut ptrs: Vec<*mut std::ffi::c_void> =
@@ -356,7 +367,7 @@ impl HipState {
             let code = unsafe {
                 hipModuleLaunchKernel(
                     func,
-                    grid_size, 1, 1,
+                    grid_x, grid_y, 1,
                     block_size, 1, 1,
                     0,
                     std::ptr::null_mut(), // default stream

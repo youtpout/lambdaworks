@@ -312,31 +312,57 @@ fn main() {
     let ds_ark = Arc::clone(&datasets);
     let ark_thread = std::thread::spawn(move || run_arkworks(&ds_ark));
 
-    // ── ROCm/HIP (main thread, concurrent with CPU threads) ───────────────────
+    // ── ROCm/HIP batched (main thread, concurrent with CPU threads) ──────────
+    // Group by curve and run a single batched kernel launch per group,
+    // instead of 30 sequential launches.
     #[cfg(feature = "rocm")]
     let hip_timings: Option<Vec<Duration>> = {
-        let mut timings = Vec::with_capacity(datasets.len());
+        let pallas_idx: Vec<usize> = datasets.iter().enumerate()
+            .filter(|(_, d)| d.curve == "pallas").map(|(i, _)| i).collect();
+        let vesta_idx: Vec<usize>  = datasets.iter().enumerate()
+            .filter(|(_, d)| d.curve == "vesta").map(|(i, _)| i).collect();
+
+        let mut timings = vec![Duration::ZERO; datasets.len()];
         let mut ok = true;
-        for ds in datasets.iter() {
-            let msm_result = match ds.curve.as_str() {
+
+        for (curve_name, indices) in [("pallas", &pallas_idx), ("vesta", &vesta_idx)] {
+            if indices.is_empty() { continue; }
+            let n = datasets[indices[0]].n;
+
+            let base = match curve_name {
                 "pallas" => HipPippengerMSM::new_pallas(),
-                "vesta"  => HipPippengerMSM::new_vesta(),
-                _ => unreachable!(),
+                _        => HipPippengerMSM::new_vesta(),
             };
-            let base = match msm_result {
+            let base = match base {
                 Ok(b) => b,
                 Err(e) => { eprintln!("HIP init failed: {e}"); ok = false; break; }
             };
-            let config = base.config_for_num_points(ds.n);
+            let config = base.config_for_num_points(n);
             let mut msm = match HipPippengerMSM::new(config) {
                 Ok(m) => m,
                 Err(e) => { eprintln!("HIP new failed: {e}"); ok = false; break; }
             };
+
+            let batch: Vec<(&[u64], &[u64])> = indices.iter()
+                .map(|&i| (datasets[i].gpu_scalars.as_slice(), datasets[i].gpu_points.as_slice()))
+                .collect();
+
             let t = Instant::now();
-            let _ = msm.compute(&ds.gpu_scalars, &ds.gpu_points).expect("HIP compute");
-            timings.push(t.elapsed());
+            let results = match msm.compute_batch(&batch) {
+                Ok(r) => r,
+                Err(e) => { eprintln!("HIP batch failed: {e}"); ok = false; break; }
+            };
+            let elapsed = t.elapsed();
+            let per = elapsed / indices.len() as u32;
+            let _ = results;
+
+            println!("  hip {:<10} n={:<6} batch={:<3} total={} per={}",
+                curve_name, n, indices.len(), fmt_ms(elapsed), fmt_ms(per));
+
+            for &i in indices { timings[i] = per; }
         }
-        if ok && !timings.is_empty() { Some(timings) } else { None }
+
+        if ok { Some(timings) } else { None }
     };
 
     // ── Metal (main thread) ───────────────────────────────────────────────────

@@ -487,3 +487,112 @@ fn all_datasets_lambdaworks_matches_arkworks() {
         }
     }
 }
+
+// ─── compute_batch correctness ────────────────────────────────────────────────
+
+/// For all Pallas datasets: assert compute_batch produces the same affine point
+/// as individual compute() calls.
+#[test]
+#[cfg(feature = "rocm")]
+fn pallas_batch_matches_sequential() {
+    let datasets = load_datasets();
+    let pallas: Vec<_> = datasets.iter().filter(|d| d.curve == "pallas").collect();
+    assert!(!pallas.is_empty(), "no pallas datasets found");
+
+    // Prepare GPU buffers for every dataset.
+    let encoded: Vec<(Vec<u64>, Vec<u64>)> = pallas
+        .iter()
+        .map(|ds| {
+            let (scalars, points) = dataset_to_lw_pallas(ds);
+            (encode_scalars(&scalars), encode_points(&points))
+        })
+        .collect();
+
+    // Sequential reference: one compute() per dataset.
+    let sequential: Vec<_> = encoded
+        .iter()
+        .map(|(s, p)| {
+            let mut msm = HipPippengerMSM::new_pallas().expect("ROCm device required");
+            let limbs = msm.compute(s, p).expect("sequential HIP MSM failed");
+            limbs_to_point::<PallasCurve>(&limbs).to_affine()
+        })
+        .collect();
+
+    // Batched: all datasets in one kernel launch.
+    let n = pallas[0].scalars.len();
+    let base = HipPippengerMSM::new_pallas().expect("ROCm device required");
+    let config = base.config_for_num_points(n);
+    let mut msm = HipPippengerMSM::new(config).expect("ROCm device required");
+
+    let batch: Vec<(&[u64], &[u64])> = encoded
+        .iter()
+        .map(|(s, p)| (s.as_slice(), p.as_slice()))
+        .collect();
+    let batch_results = msm.compute_batch(&batch).expect("batch HIP MSM failed");
+
+    assert_eq!(
+        batch_results.len(),
+        sequential.len(),
+        "batch returned wrong number of results"
+    );
+    for (i, (limbs, seq_pt)) in batch_results.iter().zip(sequential.iter()).enumerate() {
+        let batch_pt = limbs_to_point::<PallasCurve>(limbs).to_affine();
+        assert_eq!(
+            batch_pt, *seq_pt,
+            "pallas batch[{}] != sequential (n={})",
+            i, n
+        );
+    }
+}
+
+/// For all Vesta datasets: assert compute_batch produces the same affine point
+/// as individual compute() calls.
+#[test]
+#[cfg(feature = "rocm")]
+fn vesta_batch_matches_sequential() {
+    let datasets = load_datasets();
+    let vesta: Vec<_> = datasets.iter().filter(|d| d.curve == "vesta").collect();
+    assert!(!vesta.is_empty(), "no vesta datasets found");
+
+    let encoded: Vec<(Vec<u64>, Vec<u64>)> = vesta
+        .iter()
+        .map(|ds| {
+            let (scalars, points) = dataset_to_lw_vesta(ds);
+            (encode_scalars(&scalars), encode_points(&points))
+        })
+        .collect();
+
+    let sequential: Vec<_> = encoded
+        .iter()
+        .map(|(s, p)| {
+            let mut msm = HipPippengerMSM::new_vesta().expect("ROCm device required");
+            let limbs = msm.compute(s, p).expect("sequential HIP MSM failed");
+            limbs_to_point::<VestaCurve>(&limbs).to_affine()
+        })
+        .collect();
+
+    let n = vesta[0].scalars.len();
+    let base = HipPippengerMSM::new_vesta().expect("ROCm device required");
+    let config = base.config_for_num_points(n);
+    let mut msm = HipPippengerMSM::new(config).expect("ROCm device required");
+
+    let batch: Vec<(&[u64], &[u64])> = encoded
+        .iter()
+        .map(|(s, p)| (s.as_slice(), p.as_slice()))
+        .collect();
+    let batch_results = msm.compute_batch(&batch).expect("batch HIP MSM failed");
+
+    assert_eq!(
+        batch_results.len(),
+        sequential.len(),
+        "batch returned wrong number of results"
+    );
+    for (i, (limbs, seq_pt)) in batch_results.iter().zip(sequential.iter()).enumerate() {
+        let batch_pt = limbs_to_point::<VestaCurve>(limbs).to_affine();
+        assert_eq!(
+            batch_pt, *seq_pt,
+            "vesta batch[{}] != sequential (n={})",
+            i, n
+        );
+    }
+}
