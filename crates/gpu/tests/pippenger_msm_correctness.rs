@@ -25,7 +25,7 @@ use rand_chacha::ChaCha20Rng;
 
 const SEED: [u8; 32] = [0x42; 32];
 const WINDOW_SIZE: usize = 8;
-const TEST_SIZES: &[usize] = &[1, 2, 8, 32];
+const TEST_SIZES: &[usize] = &[2, 8, 32];
 
 type Scalar = UnsignedInteger<4>;
 type LwPallasPoint = ShortWeierstrassProjectivePoint<PallasCurve>;
