@@ -357,6 +357,56 @@ impl DynamicMetalState {
 
         Ok(())
     }
+
+    /// Execute multiple compute kernels sequentially in a **single** command buffer.
+    ///
+    /// All kernels are encoded into one command buffer and submitted together,
+    /// eliminating the CPU–GPU round-trip that `execute_compute` incurs per kernel.
+    /// The GPU still runs them in the order given (no overlap).
+    ///
+    /// Each entry is `(kernel_name, buffers, thread_count)`.
+    /// Call `prepare_pipeline` for every kernel name before using this method.
+    pub fn execute_compute_seq(
+        &self,
+        kernels: &[(&str, &[&Buffer], u64)],
+    ) -> Result<(), MetalError> {
+        use metal::MTLSize;
+
+        let command_buffer = self.command_queue.new_command_buffer();
+
+        for (function_name, buffers, thread_count) in kernels {
+            let pipeline = self
+                .pipelines
+                .get(*function_name)
+                .ok_or_else(|| MetalError::FunctionError(function_name.to_string()))?;
+
+            let max_threads = pipeline.max_total_threads_per_threadgroup();
+            let threads_per_group = max_threads.min(256);
+            let thread_groups = thread_count.div_ceil(threads_per_group);
+
+            let encoder = command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(pipeline);
+            for (i, buffer) in buffers.iter().enumerate() {
+                encoder.set_buffer(i as u64, Some(buffer), 0);
+            }
+            encoder.dispatch_thread_groups(
+                MTLSize::new(thread_groups, 1, 1),
+                MTLSize::new(threads_per_group, 1, 1),
+            );
+            encoder.end_encoding();
+        }
+
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        if command_buffer.status() == MTLCommandBufferStatus::Error {
+            return Err(MetalError::ExecutionError(
+                "GPU batch command buffer completed with error".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 /// Thread-safe wrapper around DynamicMetalState.

@@ -373,12 +373,14 @@ kernel void bucket_accumulation_by_chunk(
             }
 
             uint bucket_idx = digit > 0 ? uint(digit - 1) : uint(-digit - 1);
+            // Input points are affine (z = Montgomery(1) = R mod p).
+            // jacobian_add_mixed saves ~5 field multiplications vs full jacobian_add.
             JacobianPoint p = load_point(points, scalar_idx);
             if (digit < 0) {
                 p = jacobian_neg(p, field);
             }
 
-            local_buckets[bucket_idx] = jacobian_add(local_buckets[bucket_idx], p, field);
+            local_buckets[bucket_idx] = jacobian_add_mixed(local_buckets[bucket_idx], p, field);
         }
 
         for (uint bucket_idx = 0; bucket_idx < num_buckets; bucket_idx++) {
@@ -401,7 +403,7 @@ kernel void bucket_accumulation_by_chunk(
 
         uint partial_idx = partial_base + bucket_idx;
         JacobianPoint bucket = load_point(partial_buckets, partial_idx);
-        bucket = jacobian_add(bucket, p, field);
+        bucket = jacobian_add_mixed(bucket, p, field);
         store_point(partial_buckets, partial_idx, bucket);
     }
 }
