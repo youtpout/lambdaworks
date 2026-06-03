@@ -284,10 +284,10 @@ void store_point(device ulong* points, uint point_idx, JacobianPoint p) {
     }
 }
 
-kernel void bucket_accumulation_by_bucket(
+kernel void bucket_accumulation_by_chunk(
     device const int* digits [[buffer(0)]],
     device const ulong* points [[buffer(1)]],
-    device ulong* buckets [[buffer(2)]],
+    device ulong* partial_buckets [[buffer(2)]],
     device const uint* config [[buffer(3)]],
     device const ulong* field_params [[buffer(4)]],
     uint gid [[thread_position_in_grid]]
@@ -295,6 +295,54 @@ kernel void bucket_accumulation_by_bucket(
     uint num_scalars = config[0];
     uint num_windows = config[1];
     uint num_buckets = config[2];
+    uint chunk_size = config[3];
+    uint num_chunks = config[4];
+    uint total_workers = num_windows * num_chunks;
+
+    if (gid >= total_workers) {
+        return;
+    }
+
+    uint window_idx = gid / num_chunks;
+    uint chunk_idx = gid % num_chunks;
+    uint start = chunk_idx * chunk_size;
+    uint end = min(start + chunk_size, num_scalars);
+    uint partial_base = (window_idx * num_chunks + chunk_idx) * num_buckets;
+    FieldParams field = load_field(field_params);
+
+    for (uint bucket_idx = 0; bucket_idx < num_buckets; bucket_idx++) {
+        store_point(partial_buckets, partial_base + bucket_idx, jacobian_identity());
+    }
+
+    for (uint scalar_idx = start; scalar_idx < end; scalar_idx++) {
+        int digit = digits[scalar_idx * num_windows + window_idx];
+        if (digit == 0) {
+            continue;
+        }
+
+        uint bucket_idx = digit > 0 ? uint(digit - 1) : uint(-digit - 1);
+        JacobianPoint p = load_point(points, scalar_idx);
+        if (digit < 0) {
+            p = jacobian_neg(p, field);
+        }
+
+        uint partial_idx = partial_base + bucket_idx;
+        JacobianPoint bucket = load_point(partial_buckets, partial_idx);
+        bucket = jacobian_add(bucket, p, field);
+        store_point(partial_buckets, partial_idx, bucket);
+    }
+}
+
+kernel void bucket_merge(
+    device const ulong* partial_buckets [[buffer(0)]],
+    device ulong* buckets [[buffer(1)]],
+    device const uint* config [[buffer(2)]],
+    device const ulong* field_params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint num_windows = config[0];
+    uint num_buckets = config[1];
+    uint num_chunks = config[2];
     uint total_buckets = num_windows * num_buckets;
 
     if (gid >= total_buckets) {
@@ -303,20 +351,13 @@ kernel void bucket_accumulation_by_bucket(
 
     uint window_idx = gid / num_buckets;
     uint bucket_idx = gid % num_buckets;
-    int positive_digit = int(bucket_idx + 1);
-    int negative_digit = -positive_digit;
     FieldParams field = load_field(field_params);
     JacobianPoint bucket = jacobian_identity();
 
-    for (uint scalar_idx = 0; scalar_idx < num_scalars; scalar_idx++) {
-        int digit = digits[scalar_idx * num_windows + window_idx];
-        if (digit == positive_digit || digit == negative_digit) {
-            JacobianPoint p = load_point(points, scalar_idx);
-            if (digit < 0) {
-                p = jacobian_neg(p, field);
-            }
-            bucket = jacobian_add(bucket, p, field);
-        }
+    for (uint chunk_idx = 0; chunk_idx < num_chunks; chunk_idx++) {
+        uint partial_idx = (window_idx * num_chunks + chunk_idx) * num_buckets + bucket_idx;
+        JacobianPoint partial = load_point(partial_buckets, partial_idx);
+        bucket = jacobian_add(bucket, partial, field);
     }
 
     store_point(buckets, gid, bucket);

@@ -44,6 +44,8 @@ pub struct PippengerMSMConfig {
     pub field_modulus: [u64; COORD_LIMBS],
     /// Montgomery parameter `-p^{-1} mod 2^64`.
     pub montgomery_inv: u64,
+    /// Number of points accumulated by one GPU worker for one window.
+    pub chunk_size: usize,
 }
 
 impl PippengerMSMConfig {
@@ -61,11 +63,12 @@ impl PippengerMSMConfig {
     /// Montgomery representation over `field_modulus`.
     pub fn for_modulus(field_modulus: [u64; COORD_LIMBS]) -> Self {
         Self {
-            window_size: 13,
+            window_size: 8,
             scalar_limbs: COORD_LIMBS,
             bits_per_limb: 64,
             montgomery_inv: montgomery_inv64(field_modulus[0]),
             field_modulus,
+            chunk_size: 1024,
         }
     }
 
@@ -76,10 +79,10 @@ impl PippengerMSMConfig {
             5..=32 => 4,
             33..=128 => 6,
             129..=1024 => 8,
-            1025..=4096 => 10,
-            4097..=16384 => 12,
-            16385..=65536 => 13,
-            _ => 14,
+            1025..=4096 => 8,
+            4097..=16384 => 9,
+            16385..=65536 => 10,
+            _ => 11,
         }
     }
 
@@ -99,6 +102,7 @@ impl PippengerMSMConfig {
             self.bits_per_limb, 64,
             "only 64-bit scalar limbs are supported"
         );
+        assert!(self.chunk_size > 0, "chunk_size must be positive");
     }
 
     pub fn num_windows(&self) -> usize {
@@ -124,6 +128,7 @@ pub struct MetalPippengerMSM {
     config: PippengerMSMConfig,
     initialized: bool,
     max_threads_accumulation: u64,
+    max_threads_bucket_merge: u64,
     max_threads_reduction: u64,
 }
 
@@ -135,6 +140,7 @@ impl MetalPippengerMSM {
             config,
             initialized: false,
             max_threads_accumulation: 0,
+            max_threads_bucket_merge: 0,
             max_threads_reduction: 0,
         })
     }
@@ -155,7 +161,8 @@ impl MetalPippengerMSM {
         self.state.load_library(PIPPENGER_MSM_SHADER_SOURCE)?;
         self.max_threads_accumulation = self
             .state
-            .prepare_pipeline("bucket_accumulation_by_bucket")?;
+            .prepare_pipeline("bucket_accumulation_by_chunk")?;
+        self.max_threads_bucket_merge = self.state.prepare_pipeline("bucket_merge")?;
         self.max_threads_reduction = self.state.prepare_pipeline("bucket_reduction")?;
         self.initialized = true;
         Ok(())
@@ -206,18 +213,33 @@ impl MetalPippengerMSM {
 
         let num_buckets = self.config.num_buckets();
         let effective_windows = self.config.num_windows() + 1;
+        let num_chunks = num_scalars.div_ceil(self.config.chunk_size);
+        let partial_buckets_len = effective_windows * num_chunks * num_buckets * LIMBS_PER_POINT;
+        let partial_buckets_buffer = self
+            .state
+            .alloc_buffer(partial_buckets_len * std::mem::size_of::<u64>())?;
+
+        self.run_bucket_accumulation(
+            &digits_buffer,
+            &points_buffer,
+            &partial_buckets_buffer,
+            num_scalars,
+            effective_windows,
+            num_buckets,
+            num_chunks,
+        )?;
+
         let buckets_len = effective_windows * num_buckets * LIMBS_PER_POINT;
         let buckets_buffer = self
             .state
             .alloc_buffer(buckets_len * std::mem::size_of::<u64>())?;
 
-        self.run_bucket_accumulation(
-            &digits_buffer,
-            &points_buffer,
+        self.run_bucket_merge(
+            &partial_buckets_buffer,
             &buckets_buffer,
-            num_scalars,
             effective_windows,
             num_buckets,
+            num_chunks,
         )?;
 
         let window_sums_buffer = self
@@ -296,27 +318,60 @@ impl MetalPippengerMSM {
         &self,
         digits_buffer: &Buffer,
         points_buffer: &Buffer,
-        buckets_buffer: &Buffer,
+        partial_buckets_buffer: &Buffer,
         num_scalars: usize,
         num_windows: usize,
         num_buckets: usize,
+        num_chunks: usize,
     ) -> MetalResult<()> {
-        let config_data = [num_scalars as u32, num_windows as u32, num_buckets as u32];
+        let config_data = [
+            num_scalars as u32,
+            num_windows as u32,
+            num_buckets as u32,
+            self.config.chunk_size as u32,
+            num_chunks as u32,
+        ];
         let config_buffer = self.state.alloc_buffer_with_data(&config_data)?;
         let field_buffer = self.field_params_buffer()?;
-        let total_threads = (num_windows * num_buckets) as u64;
+        let total_threads = (num_windows * num_chunks) as u64;
 
         self.state.execute_compute(
-            "bucket_accumulation_by_bucket",
+            "bucket_accumulation_by_chunk",
             &[
                 digits_buffer,
                 points_buffer,
-                buckets_buffer,
+                partial_buckets_buffer,
                 &config_buffer,
                 &field_buffer,
             ],
             total_threads,
             self.max_threads_accumulation,
+        )
+    }
+
+    fn run_bucket_merge(
+        &self,
+        partial_buckets_buffer: &Buffer,
+        buckets_buffer: &Buffer,
+        num_windows: usize,
+        num_buckets: usize,
+        num_chunks: usize,
+    ) -> MetalResult<()> {
+        let config_data = [num_windows as u32, num_buckets as u32, num_chunks as u32];
+        let config_buffer = self.state.alloc_buffer_with_data(&config_data)?;
+        let field_buffer = self.field_params_buffer()?;
+        let total_threads = (num_windows * num_buckets) as u64;
+
+        self.state.execute_compute(
+            "bucket_merge",
+            &[
+                partial_buckets_buffer,
+                buckets_buffer,
+                &config_buffer,
+                &field_buffer,
+            ],
+            total_threads,
+            self.max_threads_bucket_merge,
         )
     }
 
