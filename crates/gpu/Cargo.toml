@@ -23,6 +23,9 @@ rand_chacha = "0.3.1"
 criterion = { version = "0.5.1", default-features = false }
 lambdaworks-math = { path = "../math" }
 mina-curves = { git = "https://github.com/o1-labs/proof-systems", tag = "0.3.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+num-bigint = "0.4"
 
 [build-dependencies]
 walkdir = { version = "2.3.3", optional = true }
@@ -48,4 +51,8 @@ default = []
 #   cargo bench --features rocm    (AMD)
 [[bench]]
 name = "pippenger_msm"
+harness = false
+
+[[bench]]
+name = "o1js_msm"
 harness = false

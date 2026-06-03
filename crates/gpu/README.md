@@ -133,6 +133,35 @@ cargo bench -p lambdaworks-gpu --features metal,rocm --bench pippenger_msm
 The benchmark sizes are `2^12`, `2^18`, `2^22` (defined in
 `benches/pippenger_msm.rs`).
 
+### Real-world data (o1js/Kimchi)
+
+The file `kimchi-internal-msm.zip` (workspace root) contains MSM inputs captured
+from an actual Kimchi proving run.  Extract it before running the o1js tests:
+
+```bash
+unzip kimchi-internal-msm.zip -d data/
+```
+
+This produces `data/kimchi-internal-msm.json` (30 datasets: 15 Vesta × 2 048 pts,
+15 Pallas × 8 192 pts).  A companion file `cpu-result.json` at the workspace root
+holds the expected results as computed by o1js.
+
+```bash
+# Correctness: CPU Pippenger == HIP GPU on all 30 real datasets
+cargo test -p lambdaworks-gpu --features rocm --test o1js_msm_correctness
+
+# Diagnostic: compare our results against the o1js reference (informational, never fails)
+cargo test -p lambdaworks-gpu --features rocm --test o1js_msm_correctness -- compare_against_o1js_reference --nocapture
+
+# Bench on real proving-time inputs
+cargo bench -p lambdaworks-gpu --features rocm --bench o1js_msm
+```
+
+> **Note:** our CPU and GPU results agree with each other on all 30 datasets, but
+> currently diverge from `cpu-result.json`.  The likely cause is a scalar or
+> coordinate encoding convention difference between o1js/Kimchi and lambdaworks
+> (e.g. Montgomery representation).  Investigation is ongoing.
+
 ### Measured performance (RX 6800, gfx1030, ROCm 7.2)
 
 | Variante | 2^18 (262 144 pts) |
