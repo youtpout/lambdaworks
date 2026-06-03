@@ -157,10 +157,13 @@ cargo test -p lambdaworks-gpu --features rocm --test o1js_msm_correctness -- com
 cargo bench -p lambdaworks-gpu --features rocm --bench o1js_msm
 ```
 
-> **Note:** our CPU and GPU results agree with each other on all 30 datasets, but
-> currently diverge from `cpu-result.json`.  The likely cause is a scalar or
-> coordinate encoding convention difference between o1js/Kimchi and lambdaworks
-> (e.g. Montgomery representation).  Investigation is ongoing.
+> **Note:** our CPU and GPU results agree with each other on all 30 datasets, and
+> also agree with Arkworks `VariableBaseMSM` (see the `all_datasets_lambdaworks_matches_arkworks`
+> test).  The divergence from `cpu-result.json` is a **bug in the kimchi-webgpu benchmark
+> script** (`src/tools/benchmarkKimchiCpuMsms.ts`): it encodes point coordinates through the
+> scalar-field conversion (`fq` for Pallas, `fp` for Vesta) instead of the correct base-field
+> conversion (`fp` for Pallas, `fq` for Vesta).  The scalars are encoded correctly; only the
+> point coordinates are wrong.  `cpu-result.json` is therefore not a valid reference.
 
 ### Measured performance (RX 6800, gfx1030, ROCm 7.2)
 
