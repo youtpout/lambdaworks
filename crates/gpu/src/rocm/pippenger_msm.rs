@@ -95,9 +95,11 @@ impl HipPippengerMSMConfig {
         num_windows: usize,
         cu_count: usize,
     ) -> usize {
-        // Target ~4× over-subscription relative to CU count.
-        // Assume 64 threads/CU wavefront (conservative for RDNA/CDNA).
-        let target_threads = cu_count * 64 * 4;
+        // Target ~8 wavefronts per CU for good latency hiding with window=4.
+        // With ~192 VGPRs per thread, GFX11 can sustain 4-8 wavefronts/CU.
+        // Using 8× means chunk_size shrinks → more (window,chunk) pairs → better
+        // GPU saturation compared to the old 4× factor with 60 hardcoded CUs.
+        let target_threads = cu_count * 64 * 8;
         let target_chunks = target_threads.div_ceil(num_windows);
         let raw = num_points.div_ceil(target_chunks);
         raw.max(16).next_power_of_two()
@@ -133,6 +135,8 @@ pub struct PreparedHipPippengerMSM {
     merge_config_buf: DeviceBuffer,
     reduction_config_buf: DeviceBuffer,
     field_buf: DeviceBuffer,
+    result_buf: DeviceBuffer,
+    combine_config_buf: DeviceBuffer,
     /// Total threads for the accumulation kernel = effective_windows × num_chunks.
     accum_blocks: u64,
     merge_threads: u64,
@@ -179,9 +183,9 @@ impl HipPippengerMSM {
         let window_size = HipPippengerMSMConfig::optimal_window_size(num_points);
         let effective_windows =
             (self.config.scalar_limbs * self.config.bits_per_limb).div_ceil(window_size) + 1;
-        // 60 CUs is a reasonable default for a mid-range AMD GPU (RX 6700 XT etc.)
+        let cu_count = HipState::cu_count();
         let chunk_size =
-            HipPippengerMSMConfig::optimal_chunk_size(num_points, effective_windows, 60);
+            HipPippengerMSMConfig::optimal_chunk_size(num_points, effective_windows, cu_count);
         HipPippengerMSMConfig {
             window_size,
             chunk_size,
@@ -199,6 +203,7 @@ impl HipPippengerMSM {
             .prepare_function("bucket_accumulation_by_chunk")?;
         self.state.prepare_function("bucket_merge")?;
         self.state.prepare_function("bucket_reduction")?;
+        self.state.prepare_function("combine_windows_kernel")?;
         self.initialized = true;
         Ok(())
     }
@@ -280,6 +285,14 @@ impl HipPippengerMSM {
             .alloc_buffer_with_data(&[effective_windows as u32, num_buckets as u32])?;
         let field_buf = self.field_params_buffer()?;
 
+        let result_buf =
+            self.state.alloc_buffer(LIMBS_PER_POINT * std::mem::size_of::<u64>())?;
+        let combine_config_buf = self.state.alloc_buffer_with_data(&[
+            effective_windows as u32,
+            self.config.window_size as u32,
+            1u32, // num_msms = 1 for compute_prepared
+        ])?;
+
         Ok(PreparedHipPippengerMSM {
             digits_buf,
             points_buf,
@@ -290,6 +303,8 @@ impl HipPippengerMSM {
             merge_config_buf,
             reduction_config_buf,
             field_buf,
+            result_buf,
+            combine_config_buf,
             accum_blocks: (effective_windows * num_chunks) as u64,
             merge_threads: (effective_windows * num_buckets) as u64,
             effective_windows,
@@ -379,6 +394,16 @@ impl HipPippengerMSM {
             .alloc_buffer_with_data(&[effective_windows as u32, num_buckets as u32])?;
         let field_buf = self.field_params_buffer()?;
 
+        // Allocate batch result buffer: num_msms × 12 u64.
+        let result_buf = self
+            .state
+            .alloc_buffer(num_msms * LIMBS_PER_POINT * std::mem::size_of::<u64>())?;
+        let combine_config_buf = self.state.alloc_buffer_with_data(&[
+            effective_windows as u32,
+            self.config.window_size as u32,
+            num_msms as u32,
+        ])?;
+
         let accum_bufs: &[&DeviceBuffer] = &[
             &digits_buf, &points_buf, &partial_buckets_buf, &accum_config_buf, &field_buf,
         ];
@@ -388,7 +413,12 @@ impl HipPippengerMSM {
         let reduc_bufs: &[&DeviceBuffer] = &[
             &buckets_buf, &window_sums_buf, &reduction_config_buf, &field_buf,
         ];
+        let combine_bufs: &[&DeviceBuffer] = &[
+            &window_sums_buf, &result_buf, &combine_config_buf, &field_buf,
+        ];
 
+        // The first 3 kernels use grid_y = num_msms (each MSM has its own y-slice).
+        // combine_windows_kernel uses a flat 1-D grid (msm_idx via blockIdx.x).
         self.state.execute_compute_seq_2d(
             &[
                 ("bucket_accumulation_by_chunk", accum_bufs, (effective_windows * num_chunks) as u64),
@@ -398,17 +428,20 @@ impl HipPippengerMSM {
             num_msms as u32,
         )?;
 
-        // Read back all window sums and combine on CPU.
-        let all_sums: Vec<u64> = self.state.read_buffer(
-            &window_sums_buf,
-            num_msms * effective_windows * LIMBS_PER_POINT,
+        // combine_windows_kernel: 1 thread per MSM, flat grid.
+        let combine_grid = (num_msms as u64 + 255) / 256;
+        self.state.execute_compute_seq_2d(
+            &[("combine_windows_kernel", combine_bufs, combine_grid)],
+            1,
         )?;
 
+        // Read back all results (one Jacobian point per MSM).
+        let all_results: Vec<u64> = self
+            .state
+            .read_buffer(&result_buf, num_msms * LIMBS_PER_POINT)?;
+
         let results = (0..num_msms)
-            .map(|i| {
-                let base = i * effective_windows * LIMBS_PER_POINT;
-                self.combine_windows(&all_sums[base..base + effective_windows * LIMBS_PER_POINT], effective_windows)
-            })
+            .map(|i| all_results[i * LIMBS_PER_POINT..(i + 1) * LIMBS_PER_POINT].to_vec())
             .collect();
 
         Ok(results)
@@ -439,20 +472,24 @@ impl HipPippengerMSM {
             &prepared.field_buf,
         ];
 
+        let combine_bufs: &[&DeviceBuffer] = &[
+            &prepared.window_sums_buf,
+            &prepared.result_buf,
+            &prepared.combine_config_buf,
+            &prepared.field_buf,
+        ];
+
         self.state.execute_compute_seq_2d(
             &[
                 ("bucket_accumulation_by_chunk", accum_bufs, prepared.accum_blocks as u64),
                 ("bucket_merge",                 merge_bufs, prepared.merge_threads),
                 ("bucket_reduction",             reduc_bufs, prepared.effective_windows as u64),
+                ("combine_windows_kernel",        combine_bufs, 1),
             ],
             1,
         )?;
 
-        let window_sums: Vec<u64> = self
-            .state
-            .read_buffer(&prepared.window_sums_buf, prepared.effective_windows * LIMBS_PER_POINT)?;
-
-        Ok(self.combine_windows(&window_sums, prepared.effective_windows))
+        self.state.read_buffer(&prepared.result_buf, LIMBS_PER_POINT)
     }
 
     // ─── private helpers ──────────────────────────────────────────────────
@@ -546,8 +583,8 @@ fn recode_scalars_signed(
     digits
 }
 
-// ─── CPU-side field/point arithmetic (for window combination) ─────────────────
-// Mirrors the Metal backend's CPU combine_windows exactly.
+// ─── CPU-side field/point arithmetic ─────────────────────────────────────────
+// Used only by unit tests (combine_windows has moved to the GPU kernel).
 
 #[derive(Clone, Copy)]
 struct FieldParams {

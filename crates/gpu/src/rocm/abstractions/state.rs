@@ -34,6 +34,7 @@ const HIP_MEMCPY_DEVICE_TO_HOST: u32 = 2;
 extern "C" {
     fn hipGetDeviceCount(count: *mut i32) -> u32;
     fn hipSetDevice(device: i32) -> u32;
+    fn hipDeviceGetAttribute(value: *mut i32, attrib: i32, device: i32) -> u32;
     fn hipGetErrorString(error: u32) -> *const std::os::raw::c_char;
     fn hipMalloc(ptr: *mut *mut std::ffi::c_void, size: usize) -> u32;
     fn hipFree(ptr: *mut std::ffi::c_void) -> u32;
@@ -163,6 +164,16 @@ impl HipState {
             module: None,
             functions: HashMap::new(),
         })
+    }
+
+    /// Return the number of Compute Units (multiprocessors) on device 0.
+    ///
+    /// `hipDeviceAttributeMultiprocessorCount = 16` in the HIP enum.
+    /// Falls back to 64 if the query fails.
+    pub fn cu_count() -> usize {
+        let mut v = 0i32;
+        let ok = unsafe { hipDeviceGetAttribute(&mut v, 16, 0) };
+        if ok == 0 && v > 0 { v as usize } else { 64 }
     }
 
     /// Compile `source` with hipRTC and load the resulting bitcode module.

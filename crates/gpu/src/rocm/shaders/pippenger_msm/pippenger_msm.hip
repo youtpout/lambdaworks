@@ -449,3 +449,37 @@ extern "C" __global__ void bucket_reduction(
 
     store_jacobian_point(window_sums, msm_sums_off + window_idx, result);
 }
+
+// Combine per-window sums into the final MSM result (Horner's method).
+//
+// One thread per MSM.  Sequential but saves the PCIe readback of all window
+// sums — only the final point (12 u64) is returned to the host.
+//
+// config: [num_windows, window_size, num_msms]
+extern "C" __global__ void combine_windows_kernel(
+    const u64limb* __restrict__ window_sums,  // [num_msms × num_windows × LIMBS_PER_POINT]
+    u64limb*       __restrict__ results,       // [num_msms × LIMBS_PER_POINT]
+    const uint*    __restrict__ config,
+    const u64limb* __restrict__ field_params
+) {
+    uint msm_idx     = blockIdx.x * blockDim.x + threadIdx.x;
+    uint num_windows = config[0];
+    uint window_size = config[1];
+    uint num_msms    = config[2];
+
+    if (msm_idx >= num_msms) return;
+
+    FieldParams field = load_field(field_params);
+    uint sums_base = msm_idx * num_windows;
+
+    // Horner from the most-significant window down.
+    JacobianPoint result = load_jacobian_point(window_sums, sums_base + num_windows - 1);
+    for (int i = (int)num_windows - 2; i >= 0; i--) {
+        for (uint d = 0; d < window_size; d++)
+            result = jacobian_double(result, field);
+        JacobianPoint w = load_jacobian_point(window_sums, sums_base + (uint)i);
+        result = jacobian_add(result, w, field);
+    }
+
+    store_jacobian_point(results, msm_idx, result);
+}
