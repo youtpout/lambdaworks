@@ -274,6 +274,26 @@ fn vesta_lambdaworks_cpu_and_hip_pippenger_match() {
     }
 }
 
+/// Experimental affine-batch path (`compute_affine`) must match the CPU reference.
+#[test]
+fn pallas_affine_path_matches_cpu() {
+    for &size in &[2usize, 8, 32, 64, 200] {
+        let data = pallas_data(size);
+        let expected =
+            pippenger::msm_with_signed(&data.lw_scalars, &data.lw_points, WINDOW_SIZE)
+                .to_affine();
+        let gpu_scalars = encode_scalars(&data.lw_scalars);
+        let gpu_points = encode_points(&data.lw_points);
+        let mut msm = HipPippengerMSM::new(HipPippengerMSMConfig::pallas())
+            .expect("ROCm device required");
+        let limbs = msm
+            .compute_affine(&gpu_scalars, &gpu_points)
+            .expect("HIP affine MSM failed");
+        let actual = limbs_to_point::<PallasCurve>(&limbs).to_affine();
+        assert_eq!(actual, expected, "affine-path Pallas MSM mismatch (size={size})");
+    }
+}
+
 /// Single-point MSM: result should equal the point itself (scalar = 1 in Montgomery form).
 #[test]
 fn single_point_identity_scalar_pallas() {

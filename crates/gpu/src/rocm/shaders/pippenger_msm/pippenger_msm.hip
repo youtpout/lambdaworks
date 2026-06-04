@@ -890,3 +890,143 @@ extern "C" __global__ void bucket_counting_sort(
     for (uint b = 0; b < num_buckets; b++)
         bucket_counts[cbase + b] -= bucket_start[cbase + b];
 }
+
+// ─── affine MSM stage 3b: batch-affine bucket reduction ───────────────────────
+//
+// One THREAD per window.  Each bucket keeps an affine accumulator.  The points
+// of a bucket (already grouped contiguously by bucket_counting_sort) are folded
+// in round by round: in round r every non-exhausted bucket adds its r-th point
+// to its accumulator.  All these per-bucket additions are independent, so their
+// field inversions are batched into ONE inversion per round (Montgomery trick).
+//
+// Output is written in Jacobian form (z = mont_one for a real point, z = 0 for
+// the identity) so the existing bucket_reduce_combine kernel can consume it
+// unchanged.
+//
+// Per-window scratch (caller-provided, partitioned by this kernel):
+//   fscratch (BigInt): 5 × num_buckets per window  → accx, accy, den, den_inv, prod
+//   iscratch (uint)  : 3 × num_buckets per window  → accflag, pairpos, pairkind
+//
+// config: [num_scalars, num_windows, num_buckets]
+//   accflag: 0 = identity, 1 = valid affine point
+//   pairkind: 0 = chord add, 1 = doubling
+extern "C" __global__ void bucket_affine_reduce(
+    const u64limb*     __restrict__ points,       // affine inputs [num_scalars × 8]
+    const uint*        __restrict__ sorted_idx,
+    const signed char* __restrict__ sorted_sign,
+    const uint*        __restrict__ bucket_start,
+    const uint*        __restrict__ bucket_counts,
+    u64limb*           __restrict__ buckets,      // out: Jacobian [nw × nb × 12]
+    u64limb*           __restrict__ fscratch,
+    uint*              __restrict__ iscratch,
+    const uint*        __restrict__ config,
+    const u64limb*     __restrict__ field_params
+) {
+    uint w           = blockIdx.x * blockDim.x + threadIdx.x;
+    uint msm_idx     = blockIdx.y;
+    uint num_scalars = config[0];
+    uint num_windows = config[1];
+    uint num_buckets = config[2];
+    if (w >= num_windows) return;
+
+    FieldParams field = load_field(field_params);
+
+    uint sbase = (msm_idx * num_windows + w) * num_scalars;  // sorted arrays
+    uint cbase = (msm_idx * num_windows + w) * num_buckets;  // start/counts
+    uint mpoints_off = msm_idx * num_scalars;
+
+    // Partition scratch for this window.
+    uint fbase = (uint)((blockIdx.y * num_windows + w) * (size_t)(5 * num_buckets));
+    uint ibase = (blockIdx.y * num_windows + w) * (3 * num_buckets);
+    BigInt* accx    = (BigInt*)(fscratch) + fbase + 0 * num_buckets;
+    BigInt* accy    = (BigInt*)(fscratch) + fbase + 1 * num_buckets;
+    BigInt* den     = (BigInt*)(fscratch) + fbase + 2 * num_buckets;
+    BigInt* den_inv = (BigInt*)(fscratch) + fbase + 3 * num_buckets;
+    BigInt* prod    = (BigInt*)(fscratch) + fbase + 4 * num_buckets;
+    uint* accflag  = iscratch + ibase + 0 * num_buckets;
+    uint* pairpos  = iscratch + ibase + 1 * num_buckets;
+    uint* pairkind = iscratch + ibase + 2 * num_buckets;
+
+    // Helper: load the k-th sorted point of this window (sign applied).
+    // (inlined below via a lambda-like macro)
+    BigInt three = bigint_zero(); three.limbs[0] = 3ULL;
+
+    // Round 0: seed accumulators with each bucket's first point.
+    uint maxc = 0;
+    for (uint b = 0; b < num_buckets; b++) {
+        uint c = bucket_counts[cbase + b];
+        if (c > maxc) maxc = c;
+        if (c == 0) { accflag[b] = 0; continue; }
+        uint k   = bucket_start[cbase + b];
+        uint idx = sorted_idx[sbase + k];
+        JacobianPoint p = load_affine_point(points, mpoints_off + idx, field.mont_one);
+        if (sorted_sign[sbase + k] < 0) p.y = field_neg(p.y, field);
+        accx[b] = p.x; accy[b] = p.y; accflag[b] = 1;
+    }
+
+    // Rounds 1 .. maxc-1: fold one point per bucket, batching the inversion.
+    for (uint r = 1; r < maxc; r++) {
+        uint npairs = 0;
+        for (uint b = 0; b < num_buckets; b++) {
+            if (r >= bucket_counts[cbase + b]) continue;
+            uint k   = bucket_start[cbase + b] + r;
+            uint idx = sorted_idx[sbase + k];
+            JacobianPoint q = load_affine_point(points, mpoints_off + idx, field.mont_one);
+            if (sorted_sign[sbase + k] < 0) q.y = field_neg(q.y, field);
+
+            // acc[b] is always valid here (bucket has ≥ r+1 ≥ 2 points).
+            BigInt px = accx[b], py = accy[b];
+            if (bigint_is_zero(field_sub(q.x, px, field))) {
+                // Same x: doubling (y equal) or identity (y opposite).
+                if (bigint_is_zero(field_sub(q.y, py, field))) {
+                    if (bigint_is_zero(py)) { accflag[b] = 0; }       // 2·(x,0) = ∞
+                    else {
+                        den[npairs] = field_double(py, field);        // 2y
+                        pairpos[npairs] = b; pairkind[npairs] = 1; npairs++;
+                    }
+                } else {
+                    accflag[b] = 0;                                   // P + (−P) = ∞
+                }
+            } else {
+                den[npairs] = field_sub(q.x, px, field);              // xQ − xP
+                pairpos[npairs] = b; pairkind[npairs] = 0; npairs++;
+            }
+            // stash q for the apply pass via prod[] (reuse as temp q.x) — instead
+            // recompute q in apply pass to keep storage small.
+        }
+
+        if (npairs == 0) continue;
+        batch_inverse_local(den, den_inv, npairs, field, prod);
+
+        for (uint j = 0; j < npairs; j++) {
+            uint b   = pairpos[j];
+            uint k   = bucket_start[cbase + b] + r;
+            uint idx = sorted_idx[sbase + k];
+            JacobianPoint q = load_affine_point(points, mpoints_off + idx, field.mont_one);
+            if (sorted_sign[sbase + k] < 0) q.y = field_neg(q.y, field);
+            BigInt px = accx[b], py = accy[b];
+
+            BigInt num, lambda, xr, yr, basex;
+            if (pairkind[j] == 1) {              // doubling: λ = 3x² / 2y
+                num   = mont_mul(three, mont_square(px, field), field);
+                basex = px;                      // xR = λ² − 2x
+            } else {                             // chord: λ = (yQ−yP)/(xQ−xP)
+                num   = field_sub(q.y, py, field);
+                basex = q.x;                     // xR = λ² − xP − xQ
+            }
+            lambda = mont_mul(num, den_inv[j], field);
+            xr = field_sub(field_sub(mont_square(lambda, field), px, field), basex, field);
+            yr = field_sub(mont_mul(lambda, field_sub(px, xr, field), field), py, field);
+            accx[b] = xr; accy[b] = yr;          // accflag stays 1
+        }
+    }
+
+    // Emit accumulators as Jacobian points (z = mont_one or 0 for identity).
+    uint out_base = (msm_idx * num_windows + w) * num_buckets;
+    for (uint b = 0; b < num_buckets; b++) {
+        JacobianPoint r;
+        if (accflag[b]) { r.x = accx[b]; r.y = accy[b]; r.z = field.mont_one; }
+        else            { r = jacobian_identity(); }
+        store_jacobian_point(buckets, out_base + b, r);
+    }
+}

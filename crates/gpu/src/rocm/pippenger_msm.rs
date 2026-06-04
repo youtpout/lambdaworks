@@ -237,6 +237,9 @@ impl HipPippengerMSM {
         // Keep the standalone kernels for compatibility / manual use.
         self.state.prepare_function("bucket_reduction")?;
         self.state.prepare_function("combine_windows_kernel")?;
+        // Affine-batch MSM path (counting sort → batch-affine bucket reduction).
+        self.state.prepare_function("bucket_counting_sort")?;
+        self.state.prepare_function("bucket_affine_reduce")?;
         self.initialized = true;
         Ok(())
     }
@@ -549,6 +552,100 @@ impl HipPippengerMSM {
         )?;
 
         self.state.read_buffer(&prepared.result_buf, LIMBS_PER_POINT)
+    }
+
+    /// Experimental affine-batch MSM path.
+    ///
+    /// Pipeline: counting-sort points into buckets → batch-affine bucket
+    /// reduction (one inversion per round, shared across all buckets) →
+    /// fused reduce+combine.  Correctness-first (single thread per window in
+    /// the first two stages); used to validate the affine primitives end to
+    /// end against [`compute`].
+    pub fn compute_affine(&mut self, scalars: &[u64], points: &[u64]) -> HipResult<Vec<u64>> {
+        if !self.initialized {
+            self.initialize()?;
+        }
+        let num_points = points.len() / LIMBS_PER_AFFINE;
+        let optimal = self.config_for_num_points(num_points);
+        let prev = std::mem::replace(&mut self.config, optimal);
+        let result = self.compute_affine_inner(scalars, points);
+        self.config = prev;
+        result
+    }
+
+    fn compute_affine_inner(&mut self, scalars: &[u64], points: &[u64]) -> HipResult<Vec<u64>> {
+        let ns = points.len() / LIMBS_PER_AFFINE;
+        if ns == 0 {
+            return Err(HipError::EmptyInput);
+        }
+        let nb = self.config.num_buckets();
+        let nw = self.config.num_windows() + 1; // include carry window
+
+        let digits = recode_scalars_signed(&self.config, scalars, ns);
+        let digits_buf = self.state.alloc_buffer_with_data(&digits)?;
+        let points_buf = self.state.alloc_buffer_with_data(points)?;
+
+        // Counting-sort outputs.
+        let idx_buf = self.state.alloc_buffer(nw * ns * std::mem::size_of::<u32>())?;
+        let sign_buf = self.state.alloc_buffer(nw * ns)?;
+        let start_buf = self.state.alloc_buffer(nw * nb * std::mem::size_of::<u32>())?;
+        let counts_buf = self.state.alloc_buffer(nw * nb * std::mem::size_of::<u32>())?;
+        let sort_cfg_buf =
+            self.state.alloc_buffer_with_data(&[ns as u32, nw as u32, nb as u32])?;
+
+        // Affine-reduce outputs + scratch.
+        let buckets_buf =
+            self.state.alloc_buffer(nw * nb * LIMBS_PER_POINT * std::mem::size_of::<u64>())?;
+        let fscratch_buf = self
+            .state
+            .alloc_buffer(5 * nb * nw * COORD_LIMBS * std::mem::size_of::<u64>())?;
+        let iscratch_buf =
+            self.state.alloc_buffer(3 * nb * nw * std::mem::size_of::<u32>())?;
+
+        let result_buf =
+            self.state.alloc_buffer(LIMBS_PER_POINT * std::mem::size_of::<u64>())?;
+        let rc_config_buf = self.state.alloc_buffer_with_data(&[
+            nw as u32,
+            nb as u32,
+            self.config.window_size as u32,
+        ])?;
+        let field_buf = self.field_params_buffer()?;
+
+        // Stage 3a: counting sort (one thread per window).
+        self.state.execute_compute(
+            "bucket_counting_sort",
+            &[&digits_buf, &idx_buf, &sign_buf, &start_buf, &counts_buf, &sort_cfg_buf],
+            nw as u64,
+        )?;
+
+        // Stage 3b: batch-affine bucket reduction (one thread per window).
+        self.state.execute_compute(
+            "bucket_affine_reduce",
+            &[
+                &points_buf,
+                &idx_buf,
+                &sign_buf,
+                &start_buf,
+                &counts_buf,
+                &buckets_buf,
+                &fscratch_buf,
+                &iscratch_buf,
+                &sort_cfg_buf,
+                &field_buf,
+            ],
+            nw as u64,
+        )?;
+
+        // Stage 4: fused reduce+combine (one block of nw threads).
+        let rc_bufs: &[&DeviceBuffer] =
+            &[&buckets_buf, &result_buf, &rc_config_buf, &field_buf];
+        let rc_shm = nw as u32 * LIMBS_PER_POINT as u32 * 8;
+        self.state.execute_kernels_2d(
+            &[("bucket_reduce_combine", rc_bufs, 1, nw as u32, rc_shm)],
+            1,
+        )?;
+
+        self.state.read_buffer(&result_buf, LIMBS_PER_POINT)
     }
 
     // ─── persistent-bases API ────────────────────────────────────────────
