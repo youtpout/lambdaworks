@@ -1106,6 +1106,105 @@ mod tests {
         }
     }
 
+    fn mont_inverse_cpu(a: &[u64; COORD_LIMBS], f: &FieldParams) -> [u64; COORD_LIMBS] {
+        let (exp, _) = bigint_sub(&f.modulus, &[2, 0, 0, 0]);
+        let mut result = compute_mont_one(&f.modulus);
+        let mut base = *a;
+        for limb in exp.iter() {
+            let mut e = *limb;
+            for _ in 0..64 {
+                if e & 1 == 1 {
+                    result = mont_mul(&result, &base, f);
+                }
+                base = mont_square(&base, f);
+                e >>= 1;
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn batch_affine_add_matches_cpu_pallas() {
+        let mut msm = HipPippengerMSM::new_pallas().unwrap();
+        msm.initialize().unwrap();
+        msm.state.prepare_function("batch_affine_add_test").unwrap();
+
+        let f = FieldParams {
+            modulus: PALLAS_MODULUS,
+            inv: montgomery_inv64(PALLAS_MODULUS[0]),
+        };
+
+        let n = 80usize;
+        let mut x = 0x0bad_c0de_dead_beefu64;
+        let mut next = || -> [u64; COORD_LIMBS] {
+            let mut e = [0u64; COORD_LIMBS];
+            for limb in e.iter_mut() {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+                *limb = x;
+            }
+            e[3] &= 0x3fff_ffff_ffff_ffff; // < 2^254 < p
+            e
+        };
+
+        let mut pin: Vec<u64> = Vec::new();
+        let mut qin: Vec<u64> = Vec::new();
+        let mut p_pts: Vec<([u64; 4], [u64; 4])> = Vec::new();
+        let mut q_pts: Vec<([u64; 4], [u64; 4])> = Vec::new();
+        for _ in 0..n {
+            let px = next();
+            let py = next();
+            let mut qx = next();
+            if qx == px {
+                qx[0] ^= 1;
+            }
+            let qy = next();
+            pin.extend_from_slice(&px);
+            pin.extend_from_slice(&py);
+            qin.extend_from_slice(&qx);
+            qin.extend_from_slice(&qy);
+            p_pts.push((px, py));
+            q_pts.push((qx, qy));
+        }
+
+        let pin_buf = msm.state.alloc_buffer_with_data(&pin).unwrap();
+        let qin_buf = msm.state.alloc_buffer_with_data(&qin).unwrap();
+        let rout_buf = msm
+            .state
+            .alloc_buffer(n * LIMBS_PER_AFFINE * std::mem::size_of::<u64>())
+            .unwrap();
+        let cfg_buf = msm.state.alloc_buffer_with_data(&[n as u32]).unwrap();
+        let field_buf = msm.field_params_buffer().unwrap();
+
+        msm.state
+            .execute_compute(
+                "batch_affine_add_test",
+                &[&pin_buf, &qin_buf, &rout_buf, &cfg_buf, &field_buf],
+                1,
+            )
+            .unwrap();
+        let rout: Vec<u64> = msm
+            .state
+            .read_buffer(&rout_buf, n * LIMBS_PER_AFFINE)
+            .unwrap();
+
+        for i in 0..n {
+            let (px, py) = p_pts[i];
+            let (qx, qy) = q_pts[i];
+            // CPU affine add (same formula as the GPU kernel).
+            let denom = field_sub(&qx, &px, &f);
+            let dinv = mont_inverse_cpu(&denom, &f);
+            let num = field_sub(&qy, &py, &f);
+            let lambda = mont_mul(&num, &dinv, &f);
+            let l2 = mont_square(&lambda, &f);
+            let xr = field_sub(&field_sub(&l2, &px, &f), &qx, &f);
+            let yr = field_sub(&mont_mul(&lambda, &field_sub(&px, &xr, &f), &f), &py, &f);
+
+            let base = i * LIMBS_PER_AFFINE;
+            assert_eq!(&rout[base..base + 4], &xr, "x mismatch at pair {i}");
+            assert_eq!(&rout[base + 4..base + 8], &yr, "y mismatch at pair {i}");
+        }
+    }
+
     #[test]
     fn identity_arithmetic_is_stable() {
         let field = FieldParams {

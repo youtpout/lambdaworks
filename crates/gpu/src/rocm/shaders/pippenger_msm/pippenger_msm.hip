@@ -294,7 +294,8 @@ __device__ BigInt mont_inverse(BigInt a, FieldParams f) {
 
 // Batch inversion via Montgomery's trick over a contiguous array slice held by
 // one thread.  N independent inverses cost 3·(N−1) muls + 1 inversion instead of
-// N inversions.  `vals` and `out` may alias.  Caller guarantees all vals ≠ 0.
+// N inversions.  `out` must NOT alias `vals` (the back loop reads vals[i] after
+// writing out[i]).  Caller guarantees all vals ≠ 0.
 //
 //   prefix products → single inverse → back-substitution
 __device__ void batch_inverse_local(const BigInt* vals, BigInt* out, uint n, FieldParams f,
@@ -310,6 +311,40 @@ __device__ void batch_inverse_local(const BigInt* vals, BigInt* out, uint n, Fie
         inv    = mont_mul(inv, vals[i], f);          // strip vals[i]
     }
     out[0] = inv;
+}
+
+// ─── affine point batch addition ──────────────────────────────────────────────
+
+struct AffinePoint { BigInt x; BigInt y; };
+
+// Add n independent pairs R[i] = P[i] + Q[i] in affine coordinates, sharing a
+// single field inversion across all pairs (Montgomery's trick).
+//
+// Per pair (distinct, P[i] ≠ ±Q[i]):
+//   λ  = (yQ − yP) / (xQ − xP)
+//   xR = λ² − xP − xQ
+//   yR = λ·(xP − xR) − yP
+//
+// Cost ≈ 6 muls/pair + 1 amortised inversion (≈ 380/n muls).  For n ≫ 64 this is
+// far cheaper than the ~10 mont_muls of a Jacobian mixed-add.
+//
+// Caller guarantees xP[i] ≠ xQ[i] for all i (no doubling / identity in batch).
+// `denom`, `denom_inv`, `scratch` are caller-provided length-n workspaces.
+__device__ void batch_affine_add_local(
+    const AffinePoint* P, const AffinePoint* Q, AffinePoint* R, uint n, FieldParams f,
+    BigInt* denom, BigInt* denom_inv, BigInt* scratch
+) {
+    for (uint i = 0; i < n; i++) denom[i] = field_sub(Q[i].x, P[i].x, f);
+    batch_inverse_local(denom, denom_inv, n, f, scratch);
+    for (uint i = 0; i < n; i++) {
+        BigInt num    = field_sub(Q[i].y, P[i].y, f);
+        BigInt lambda = mont_mul(num, denom_inv[i], f);
+        BigInt l2     = mont_square(lambda, f);
+        BigInt xr     = field_sub(field_sub(l2, P[i].x, f), Q[i].x, f);
+        BigInt yr     = field_sub(mont_mul(lambda, field_sub(P[i].x, xr, f), f), P[i].y, f);
+        R[i].x = xr;
+        R[i].y = yr;
+    }
 }
 
 // ─── Jacobian point operations ────────────────────────────────────────────────
@@ -738,4 +773,47 @@ extern "C" __global__ void batch_inverse_test(
     for (uint i = 0; i < n; i++)
         for (uint l = 0; l < NUM_LIMBS; l++)
             out[i * NUM_LIMBS + l] = res[i].limbs[l];
+}
+
+// ─── test kernel: batch affine addition ──────────────────────────────────────
+//
+// Single thread computes R[i] = P[i] + Q[i] (affine) for i in [0,n).
+// P, Q, R are flat [n × LIMBS_PER_AFFINE].  config: [n].  Test-only.
+extern "C" __global__ void batch_affine_add_test(
+    const u64limb* __restrict__ pin,
+    const u64limb* __restrict__ qin,
+    u64limb*       __restrict__ rout,
+    const uint*    __restrict__ config,
+    const u64limb* __restrict__ field_params
+) {
+    if (blockIdx.x * blockDim.x + threadIdx.x != 0) return;
+    uint n = config[0];
+    if (n > BATCH_INV_TEST_MAX) return;
+
+    FieldParams field = load_field(field_params);
+
+    AffinePoint P[BATCH_INV_TEST_MAX];
+    AffinePoint Q[BATCH_INV_TEST_MAX];
+    AffinePoint R[BATCH_INV_TEST_MAX];
+    BigInt denom[BATCH_INV_TEST_MAX];
+    BigInt denom_inv[BATCH_INV_TEST_MAX];
+    BigInt scratch[BATCH_INV_TEST_MAX];
+
+    for (uint i = 0; i < n; i++) {
+        for (uint l = 0; l < NUM_LIMBS; l++) {
+            P[i].x.limbs[l] = pin[i * LIMBS_PER_AFFINE + l];
+            P[i].y.limbs[l] = pin[i * LIMBS_PER_AFFINE + NUM_LIMBS + l];
+            Q[i].x.limbs[l] = qin[i * LIMBS_PER_AFFINE + l];
+            Q[i].y.limbs[l] = qin[i * LIMBS_PER_AFFINE + NUM_LIMBS + l];
+        }
+    }
+
+    batch_affine_add_local(P, Q, R, n, field, denom, denom_inv, scratch);
+
+    for (uint i = 0; i < n; i++) {
+        for (uint l = 0; l < NUM_LIMBS; l++) {
+            rout[i * LIMBS_PER_AFFINE + l]             = R[i].x.limbs[l];
+            rout[i * LIMBS_PER_AFFINE + NUM_LIMBS + l] = R[i].y.limbs[l];
+        }
+    }
 }
