@@ -26,6 +26,8 @@
 #define LIMBS_PER_POINT  (NUM_LIMBS * COORDS_PER_POINT)   // 12 – Jacobian bucket format
 #define LIMBS_PER_AFFINE (NUM_LIMBS * 2)                  //  8 – affine input point format
 #define MAX_PRIVATE_BUCKETS 8   // window_size=4 → num_buckets=8 → 192 VGPRs (fits RDNA3)
+#define MERGE_BLOCK_SIZE    64  // threads per block for bucket_merge LDS tree reduction
+                                // LDS per block: 64 × 12 × 8 = 6 144 B  (well under 64 KB/CU)
 
 typedef unsigned long long u64limb;
 typedef unsigned int       uint;
@@ -338,7 +340,7 @@ __device__ void store_jacobian_point(u64limb* __restrict__ points, uint point_id
 //
 // config: [num_scalars, num_windows, num_buckets, chunk_size, num_chunks]
 extern "C" __global__ void bucket_accumulation_by_chunk(
-    const int*     __restrict__ digits,
+    const signed char* __restrict__ digits,  // i8: fits window_size ≤ 7 (range −64..64)
     const u64limb* __restrict__ points,      // affine: LIMBS_PER_AFFINE per point
     u64limb*       __restrict__ partial_buckets,
     const uint*    __restrict__ config,
@@ -375,7 +377,8 @@ extern "C" __global__ void bucket_accumulation_by_chunk(
 
     for (uint s = start; s < end; s++) {
         // Transposed layout → adjacent gids hit adjacent memory locations → coalesced.
-        int digit = digits[window_digit_base + s];
+        // Cast to int to preserve sign extension from the i8 representation.
+        int digit = (int)digits[window_digit_base + s];
         if (digit == 0) continue;
         uint bucket_idx = (digit > 0) ? (uint)(digit - 1) : (uint)(-digit - 1);
         JacobianPoint p = load_affine_point(points, msm_points_off + s, field.mont_one);
@@ -387,37 +390,73 @@ extern "C" __global__ void bucket_accumulation_by_chunk(
         store_jacobian_point(partial_buckets, partial_base + b, local_buckets[b]);
 }
 
+// Merge per-chunk partial buckets into one bucket per (window, bucket) pair.
+//
+// Launch geometry:
+//   blockIdx.x  = window_idx * num_buckets + bucket_idx  (one block per pair)
+//   blockIdx.y  = MSM index within a batch
+//   threadIdx.x = lane within block  (0 .. MERGE_BLOCK_SIZE-1)
+//
+// Each thread strides over chunks, accumulates a local sub-sum, then the block
+// performs a tree reduction in LDS to produce the final merged bucket.
+//
+// With MERGE_BLOCK_SIZE = 64 = one full wavefront (RDNA3), __syncthreads() is a
+// no-op; the tree reduction is therefore free of cross-wavefront synchronisation.
+// LDS: 64 × 12 × 8 = 6 144 bytes/block → fits easily in the 64 KB/CU budget.
+//
+// config: [num_windows, num_buckets, num_chunks]
 extern "C" __global__ void bucket_merge(
     const u64limb* __restrict__ partial_buckets,
     u64limb*       __restrict__ buckets,
     const uint*    __restrict__ config,
     const u64limb* __restrict__ field_params
 ) {
-    uint gid         = blockIdx.x * blockDim.x + threadIdx.x;
+    uint pair_idx    = blockIdx.x;   // linear (window, bucket) index
     uint msm_idx     = blockIdx.y;
     uint num_windows = config[0];
     uint num_buckets = config[1];
     uint num_chunks  = config[2];
-    uint total_buckets = num_windows * num_buckets;
+    uint tid         = threadIdx.x;  // 0 .. MERGE_BLOCK_SIZE-1
 
-    if (gid >= total_buckets) return;
+    if (pair_idx >= num_windows * num_buckets) return;
 
-    uint window_idx = gid / num_buckets;
-    uint bucket_idx = gid % num_buckets;
+    uint window_idx = pair_idx / num_buckets;
+    uint bucket_idx = pair_idx % num_buckets;
 
     uint msm_partial_off = msm_idx * (num_windows * num_chunks * num_buckets);
-    uint msm_buckets_off = msm_idx * (num_windows * num_buckets);
-
     FieldParams field = load_field(field_params);
-    JacobianPoint bucket = jacobian_identity();
 
-    for (uint c = 0; c < num_chunks; c++) {
-        uint partial_idx = msm_partial_off + (window_idx * num_chunks + c) * num_buckets + bucket_idx;
+    // ── Phase 1: each thread strides over its chunk slice ────────────────────
+    JacobianPoint local = jacobian_identity();
+    for (uint c = tid; c < num_chunks; c += MERGE_BLOCK_SIZE) {
+        uint partial_idx = msm_partial_off
+                         + (window_idx * num_chunks + c) * num_buckets
+                         + bucket_idx;
         JacobianPoint partial = load_jacobian_point(partial_buckets, partial_idx);
-        bucket = jacobian_add(bucket, partial, field);
+        local = jacobian_add(local, partial, field);
     }
 
-    store_jacobian_point(buckets, msm_buckets_off + gid, bucket);
+    // ── Phase 2: write local sub-sums into LDS ───────────────────────────────
+    __shared__ u64limb lds[MERGE_BLOCK_SIZE * LIMBS_PER_POINT];
+    store_jacobian_point(lds, tid, local);
+    __syncthreads();
+
+    // ── Phase 3: tree reduction in LDS (log2(MERGE_BLOCK_SIZE) = 6 steps) ───
+    for (uint stride = MERGE_BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            JacobianPoint a = load_jacobian_point(lds, tid);
+            JacobianPoint b = load_jacobian_point(lds, tid + stride);
+            store_jacobian_point(lds, tid, jacobian_add(a, b, field));
+        }
+        __syncthreads();
+    }
+
+    // ── Phase 4: lane 0 writes the merged bucket ──────────────────────────────
+    if (tid == 0) {
+        uint msm_buckets_off = msm_idx * (num_windows * num_buckets);
+        store_jacobian_point(buckets, msm_buckets_off + pair_idx,
+                             load_jacobian_point(lds, 0));
+    }
 }
 
 extern "C" __global__ void bucket_reduction(

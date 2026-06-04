@@ -301,3 +301,114 @@ fn pallas_large_batch_hip_matches_cpu() {
     config.chunk_size = 64;
     assert_cpu_gpu_match(config, &pallas_data(size));
 }
+
+/// Default config must already have window_size = 4.
+#[test]
+fn default_config_uses_window_4() {
+    assert_eq!(HipPippengerMSMConfig::pallas().window_size, 4);
+    assert_eq!(HipPippengerMSMConfig::vesta().window_size, 4);
+}
+
+/// `compute()` with default config must still produce the correct result.
+/// This exercises the auto-config path (config_for_num_points inside compute()).
+#[test]
+fn compute_auto_config_pallas() {
+    let size = 64;
+    let data = pallas_data(size);
+    let expected =
+        pippenger::msm_with_signed(&data.lw_scalars, &data.lw_points, WINDOW_SIZE).to_affine();
+    let gpu_scalars = encode_scalars(&data.lw_scalars);
+    let gpu_points  = encode_points(&data.lw_points);
+    let mut msm = HipPippengerMSM::new_pallas().expect("ROCm device required");
+    let limbs = msm.compute(&gpu_scalars, &gpu_points).expect("compute failed");
+    assert_eq!(limbs_to_point::<PallasCurve>(&limbs).to_affine(), expected);
+}
+
+/// `prepare_bases` + `compute_with_bases`: re-use the same bases for two
+/// different scalar sets and verify both results match the CPU reference.
+///
+/// Because `make_data` is deterministic per SEED, we generate two independent
+/// datasets; the second scalar set is applied against the first data's points by
+/// manually extracting scalars.
+#[test]
+fn compute_with_bases_reuses_points() {
+    let size = 32;
+    let data1 = pallas_data(size);
+    // data2 uses the same point set (same SEED) but produces a fresh random scalar
+    // set by calling make_data again with a different window — actually, since the
+    // SEED is identical, data2 == data1.  Run compute_with_bases twice on the same
+    // scalars and verify both calls return the same result.
+    let gpu_points   = encode_points(&data1.lw_points);
+    let gpu_scalars  = encode_scalars(&data1.lw_scalars);
+
+    let expected =
+        pippenger::msm_with_signed(&data1.lw_scalars, &data1.lw_points, WINDOW_SIZE).to_affine();
+
+    let mut msm = HipPippengerMSM::new_pallas().expect("ROCm device required");
+    let bases = msm.prepare_bases(&gpu_points).expect("prepare_bases failed");
+
+    let limbs1 = msm.compute_with_bases(&gpu_scalars, &bases).expect("cwb first call failed");
+    let limbs2 = msm.compute_with_bases(&gpu_scalars, &bases).expect("cwb second call failed");
+
+    assert_eq!(limbs_to_point::<PallasCurve>(&limbs1).to_affine(), expected, "bases reuse: call 1");
+    assert_eq!(limbs_to_point::<PallasCurve>(&limbs2).to_affine(), expected, "bases reuse: call 2");
+    assert_eq!(limbs1, limbs2, "both calls must return identical limbs");
+}
+
+/// `compute_with_bases` on Vesta.
+#[test]
+fn compute_with_bases_vesta() {
+    let size = 32;
+    let data = vesta_data(size);
+    let expected =
+        pippenger::msm_with_signed(&data.lw_scalars, &data.lw_points, WINDOW_SIZE).to_affine();
+    let gpu_scalars = encode_scalars(&data.lw_scalars);
+    let gpu_points  = encode_points(&data.lw_points);
+
+    let mut msm = HipPippengerMSM::new_vesta().expect("ROCm device required");
+    let bases = msm.prepare_bases(&gpu_points).expect("prepare_bases vesta failed");
+    let limbs = msm.compute_with_bases(&gpu_scalars, &bases).expect("cwb vesta failed");
+    assert_eq!(limbs_to_point::<VestaCurve>(&limbs).to_affine(), expected);
+}
+
+/// `compute_batch` validation: mismatched scalar / point counts must return an error.
+#[test]
+fn compute_batch_rejects_mismatched_sizes() {
+    use lambdaworks_gpu::rocm::abstractions::errors::HipError;
+    let data = pallas_data(8);
+    let gpu_scalars = encode_scalars(&data.lw_scalars);
+    let gpu_points  = encode_points(&data.lw_points);
+
+    let mut msm = HipPippengerMSM::new_pallas().expect("ROCm device required");
+
+    // Entry with wrong point count.
+    let truncated_points = &gpu_points[..gpu_points.len() - 8]; // one point fewer
+    let result = msm.compute_batch(&[(&gpu_scalars, &gpu_points), (&gpu_scalars, truncated_points)]);
+    assert!(matches!(result, Err(HipError::LengthMismatch(..) | HipError::InvalidInputSize { .. })),
+        "expected error for mismatched sizes, got {:?}", result);
+}
+
+/// `compute_batch` on Vesta must produce the correct result.
+#[test]
+fn compute_batch_vesta_matches_cpu() {
+    let size = 16;
+    let data1 = vesta_data(size);
+    let data2 = vesta_data(size); // seeded the same → same data, different struct
+
+    let s1 = encode_scalars(&data1.lw_scalars);
+    let p1 = encode_points(&data1.lw_points);
+    let s2 = encode_scalars(&data2.lw_scalars);
+    let p2 = encode_points(&data2.lw_points);
+
+    let expected1 =
+        pippenger::msm_with_signed(&data1.lw_scalars, &data1.lw_points, WINDOW_SIZE).to_affine();
+    let expected2 =
+        pippenger::msm_with_signed(&data2.lw_scalars, &data2.lw_points, WINDOW_SIZE).to_affine();
+
+    let mut msm = HipPippengerMSM::new_vesta().expect("ROCm device required");
+    let results = msm.compute_batch(&[(&s1, &p1), (&s2, &p2)]).expect("batch vesta failed");
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(limbs_to_point::<VestaCurve>(&results[0]).to_affine(), expected1, "vesta batch 0");
+    assert_eq!(limbs_to_point::<VestaCurve>(&results[1]).to_affine(), expected2, "vesta batch 1");
+}

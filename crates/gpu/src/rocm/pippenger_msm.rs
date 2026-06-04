@@ -12,6 +12,11 @@ use super::abstractions::{
 const PIPPENGER_MSM_HIP_SOURCE: &str =
     include_str!("shaders/pippenger_msm/pippenger_msm.hip");
 
+/// Must match `MERGE_BLOCK_SIZE` in the HIP shader.
+const MERGE_BLOCK_SIZE: u32 = 64;
+/// LDS shared memory per `bucket_merge` block: 64 threads × 12 limbs × 8 bytes.
+const MERGE_SHM_BYTES: u32 = MERGE_BLOCK_SIZE * LIMBS_PER_POINT as u32 * 8;
+
 const COORD_LIMBS: usize = 4;
 const COORDS_PER_POINT: usize = 3;
 /// Limbs in a Jacobian bucket point (x,y,z — 12 u64s).
@@ -57,12 +62,16 @@ impl HipPippengerMSMConfig {
 
     pub fn for_modulus(field_modulus: [u64; COORD_LIMBS]) -> Self {
         Self {
-            window_size: 7,
+            // window_size = 4: num_buckets = 8 → 8 × 12 u64 = 192 VGPRs < 256/lane limit →
+            // zero register spilling on RDNA3.  `compute()` always calls
+            // `config_for_num_points()` to get the best chunk_size for the actual input.
+            window_size: 4,
             scalar_limbs: COORD_LIMBS,
             bits_per_limb: 64,
             montgomery_inv: montgomery_inv64(field_modulus[0]),
             field_modulus,
-            chunk_size: 256,
+            // Conservative fallback; `compute()` / `config_for_num_points()` override this.
+            chunk_size: 64,
         }
     }
 
@@ -137,10 +146,23 @@ pub struct PreparedHipPippengerMSM {
     field_buf: DeviceBuffer,
     result_buf: DeviceBuffer,
     combine_config_buf: DeviceBuffer,
-    /// Total threads for the accumulation kernel = effective_windows × num_chunks.
-    accum_blocks: u64,
-    merge_threads: u64,
     effective_windows: usize,
+    num_chunks: usize,
+    num_buckets: usize,
+}
+
+// ─── persistent bases ─────────────────────────────────────────────────────────
+
+/// Affine input points pre-uploaded to GPU memory for reuse across many MSMs.
+///
+/// Create once via [`HipPippengerMSM::prepare_bases`]; reuse with
+/// [`HipPippengerMSM::compute_with_bases`].  Avoids the PCIe transfer cost of
+/// re-uploading the same base points for every scalar change.
+pub struct HipPippengerBases {
+    points_buf: DeviceBuffer,
+    field_buf: DeviceBuffer,
+    /// Number of affine input points (= `x/y` pairs).
+    pub num_points: usize,
 }
 
 // ─── main struct ──────────────────────────────────────────────────────────────
@@ -211,10 +233,17 @@ impl HipPippengerMSM {
     /// Compute `Σ scalars[i] * points[i]`.
     ///
     /// `scalars`: flat `[s0_l0, ..., s0_l3, s1_l0, ...]`.
-    /// `points`:  flat `[x0_l0..x0_l3, y0_l0..y0_l3, z0_l0..z0_l3, x1_l0..]`.
+    /// `points`:  flat `[x0_l0..x0_l3, y0_l0..y0_l3, x1_l0..]` (affine, 8 limbs/point).
+    ///
+    /// Automatically derives the optimal `window_size` and `chunk_size` for the
+    /// given input length.  `self.config` is restored after the call.
     pub fn compute(&mut self, scalars: &[u64], points: &[u64]) -> HipResult<Vec<u64>> {
-        let prepared = self.prepare(scalars, points)?;
-        self.compute_prepared(&prepared)
+        let num_points = points.len() / LIMBS_PER_AFFINE;
+        let optimal = self.config_for_num_points(num_points);
+        let prev_config = std::mem::replace(&mut self.config, optimal);
+        let result = self.prepare(scalars, points).and_then(|p| self.compute_prepared(&p));
+        self.config = prev_config;
+        result
     }
 
     pub fn prepare(
@@ -305,17 +334,19 @@ impl HipPippengerMSM {
             field_buf,
             result_buf,
             combine_config_buf,
-            accum_blocks: (effective_windows * num_chunks) as u64,
-            merge_threads: (effective_windows * num_buckets) as u64,
             effective_windows,
+            num_chunks,
+            num_buckets,
         })
     }
 
     /// Compute multiple MSMs in a single batched GPU kernel launch.
     ///
-    /// All entries in `batch` must have the same number of points and use the
-    /// same curve (i.e. the same `config`).  Results are returned in the same
-    /// order as the input.
+    /// All entries in `batch` must have the same number of points and scalars.
+    /// Results are returned in the same order as the input.
+    ///
+    /// Validates every entry strictly and auto-derives optimal `window_size` /
+    /// `chunk_size` for the given input size.  `self.config` is not modified.
     pub fn compute_batch(
         &mut self,
         batch: &[(&[u64], &[u64])],
@@ -329,42 +360,78 @@ impl HipPippengerMSM {
 
         let num_msms = batch.len();
 
-        // Validate and determine per-MSM sizes from the first entry.
-        let num_scalars = batch[0].0.len() / self.config.scalar_limbs;
-        let num_points  = batch[0].1.len() / LIMBS_PER_AFFINE;
-        if num_scalars != num_points || num_scalars == 0 {
+        // ── strict per-entry validation ─────────────────────────────────────
+        let (s0, p0) = batch[0];
+        if s0.len() % self.config.scalar_limbs != 0 {
+            return Err(HipError::InvalidInputSize {
+                expected: self.config.scalar_limbs,
+                actual: s0.len(),
+            });
+        }
+        if p0.len() % LIMBS_PER_AFFINE != 0 {
+            return Err(HipError::InvalidInputSize {
+                expected: LIMBS_PER_AFFINE,
+                actual: p0.len(),
+            });
+        }
+        let num_scalars = s0.len() / self.config.scalar_limbs;
+        let num_points  = p0.len() / LIMBS_PER_AFFINE;
+        if num_scalars == 0 {
+            return Err(HipError::EmptyInput);
+        }
+        if num_scalars != num_points {
             return Err(HipError::LengthMismatch(num_scalars, num_points));
         }
-
-        // Concatenate all scalars and points into single host buffers.
-        let total_scalars = batch[0].0.len() * num_msms;
-        let total_points  = batch[0].1.len() * num_msms;
-        let mut all_scalars_raw = Vec::with_capacity(total_scalars);
-        let mut all_points_raw  = Vec::with_capacity(total_points);
-        for (s, p) in batch {
-            all_scalars_raw.extend_from_slice(s);
-            all_points_raw.extend_from_slice(p);
+        for (s, p) in batch.iter().skip(1) {
+            if s.len() % self.config.scalar_limbs != 0 {
+                return Err(HipError::InvalidInputSize {
+                    expected: self.config.scalar_limbs,
+                    actual: s.len(),
+                });
+            }
+            if p.len() % LIMBS_PER_AFFINE != 0 {
+                return Err(HipError::InvalidInputSize {
+                    expected: LIMBS_PER_AFFINE,
+                    actual: p.len(),
+                });
+            }
+            let ns = s.len() / self.config.scalar_limbs;
+            let np = p.len() / LIMBS_PER_AFFINE;
+            if ns != num_scalars {
+                return Err(HipError::LengthMismatch(num_scalars, ns));
+            }
+            if np != num_scalars {
+                return Err(HipError::LengthMismatch(num_scalars, np));
+            }
         }
 
-        // Recode all scalars (flat: [msm0_digits..., msm1_digits..., ...]).
-        let num_buckets     = self.config.num_buckets();
-        let effective_windows = self.config.num_windows() + 1;
-        let num_chunks      = num_scalars.div_ceil(self.config.chunk_size);
+        // ── auto-derive optimal config (does not mutate self.config) ────────
+        let config = self.config_for_num_points(num_scalars);
+        let num_buckets       = config.num_buckets();
+        let effective_windows = config.num_windows() + 1;
+        let num_chunks        = num_scalars.div_ceil(config.chunk_size);
 
-        let mut all_digits = Vec::with_capacity(num_msms * num_scalars * effective_windows);
-        for i in 0..num_msms {
-            let scalar_slice = &all_scalars_raw[i * batch[0].0.len()..][..batch[0].0.len()];
-            let digits = recode_scalars_signed(&self.config, scalar_slice, num_scalars);
+        // ── recode scalars directly — no intermediate all_scalars_raw copy ──
+        let mut all_digits: Vec<i8> =
+            Vec::with_capacity(num_msms * effective_windows * num_scalars);
+        for (s, _) in batch {
+            let digits = recode_scalars_signed(&config, s, num_scalars);
             all_digits.extend_from_slice(&digits);
         }
 
-        // Upload concatenated buffers.
-        let digits_buf = self.state.alloc_buffer_with_data(&all_digits)?;
-        let points_buf = self.state.alloc_buffer_with_data(&all_points_raw)?;
+        // ── concatenate points for a single GPU upload ──────────────────────
+        let mut all_points: Vec<u64> =
+            Vec::with_capacity(num_msms * num_scalars * LIMBS_PER_AFFINE);
+        for (_, p) in batch {
+            all_points.extend_from_slice(p);
+        }
 
-        // Allocate batch-sized intermediate buffers.
-        // No pre-zeroing needed: each thread initialises its own bucket to identity.
-        let partial_len = num_msms * effective_windows * num_chunks * num_buckets * LIMBS_PER_POINT;
+        let digits_buf = self.state.alloc_buffer_with_data(&all_digits)?;
+        let points_buf = self.state.alloc_buffer_with_data(&all_points)?;
+
+        // ── intermediate GPU buffers ─────────────────────────────────────────
+        let partial_len =
+            num_msms * effective_windows * num_chunks * num_buckets * LIMBS_PER_POINT;
         let partial_buckets_buf =
             self.state.alloc_buffer(partial_len * std::mem::size_of::<u64>())?;
 
@@ -376,12 +443,16 @@ impl HipPippengerMSM {
             num_msms * effective_windows * LIMBS_PER_POINT * std::mem::size_of::<u64>(),
         )?;
 
-        // Config buffers (same as single-MSM — per-MSM sizes, shared across all).
+        let result_buf = self.state.alloc_buffer(
+            num_msms * LIMBS_PER_POINT * std::mem::size_of::<u64>(),
+        )?;
+
+        // ── config buffers ───────────────────────────────────────────────────
         let accum_config_buf = self.state.alloc_buffer_with_data(&[
             num_scalars as u32,
             effective_windows as u32,
             num_buckets as u32,
-            self.config.chunk_size as u32,
+            config.chunk_size as u32,
             num_chunks as u32,
         ])?;
         let merge_config_buf = self.state.alloc_buffer_with_data(&[
@@ -392,18 +463,14 @@ impl HipPippengerMSM {
         let reduction_config_buf = self
             .state
             .alloc_buffer_with_data(&[effective_windows as u32, num_buckets as u32])?;
-        let field_buf = self.field_params_buffer()?;
-
-        // Allocate batch result buffer: num_msms × 12 u64.
-        let result_buf = self
-            .state
-            .alloc_buffer(num_msms * LIMBS_PER_POINT * std::mem::size_of::<u64>())?;
         let combine_config_buf = self.state.alloc_buffer_with_data(&[
             effective_windows as u32,
-            self.config.window_size as u32,
+            config.window_size as u32,
             num_msms as u32,
         ])?;
+        let field_buf = self.field_params_buffer()?;
 
+        // ── kernel argument slices ───────────────────────────────────────────
         let accum_bufs: &[&DeviceBuffer] = &[
             &digits_buf, &points_buf, &partial_buckets_buf, &accum_config_buf, &field_buf,
         ];
@@ -417,34 +484,35 @@ impl HipPippengerMSM {
             &window_sums_buf, &result_buf, &combine_config_buf, &field_buf,
         ];
 
-        // The first 3 kernels use grid_y = num_msms (each MSM has its own y-slice).
-        // combine_windows_kernel uses a flat 1-D grid (msm_idx via blockIdx.x).
-        self.state.execute_compute_seq_2d(
+        // ── kernel launches ──────────────────────────────────────────────────
+        let accum_gx   = ((effective_windows * num_chunks) as u32 + 255) / 256;
+        let merge_gx   = (effective_windows * num_buckets) as u32; // one block per pair
+        let reduc_gx   = (effective_windows as u32 + 255) / 256;
+        let combine_gx = (num_msms as u32 + 255) / 256;
+
+        // First 3 kernels: grid_y = num_msms (each MSM gets its own y-slice).
+        self.state.execute_kernels_2d(
             &[
-                ("bucket_accumulation_by_chunk", accum_bufs, (effective_windows * num_chunks) as u64),
-                ("bucket_merge",                 merge_bufs, (effective_windows * num_buckets) as u64),
-                ("bucket_reduction",             reduc_bufs, effective_windows as u64),
+                ("bucket_accumulation_by_chunk", accum_bufs, accum_gx, 256,              0),
+                ("bucket_merge",                 merge_bufs, merge_gx, MERGE_BLOCK_SIZE, MERGE_SHM_BYTES),
+                ("bucket_reduction",             reduc_bufs, reduc_gx, 256,              0),
             ],
             num_msms as u32,
         )?;
 
-        // combine_windows_kernel: 1 thread per MSM, flat grid.
-        let combine_grid = (num_msms as u64 + 255) / 256;
-        self.state.execute_compute_seq_2d(
-            &[("combine_windows_kernel", combine_bufs, combine_grid)],
+        // combine_windows uses a flat 1-D grid: msm_idx = blockIdx.x*256 + threadIdx.x.
+        self.state.execute_kernels_2d(
+            &[("combine_windows_kernel", combine_bufs, combine_gx, 256, 0)],
             1,
         )?;
 
-        // Read back all results (one Jacobian point per MSM).
-        let all_results: Vec<u64> = self
-            .state
-            .read_buffer(&result_buf, num_msms * LIMBS_PER_POINT)?;
+        // ── read back one Jacobian point per MSM ────────────────────────────
+        let all_results: Vec<u64> =
+            self.state.read_buffer(&result_buf, num_msms * LIMBS_PER_POINT)?;
 
-        let results = (0..num_msms)
+        Ok((0..num_msms)
             .map(|i| all_results[i * LIMBS_PER_POINT..(i + 1) * LIMBS_PER_POINT].to_vec())
-            .collect();
-
-        Ok(results)
+            .collect())
     }
 
     pub fn compute_prepared(
@@ -479,17 +547,157 @@ impl HipPippengerMSM {
             &prepared.field_buf,
         ];
 
-        self.state.execute_compute_seq_2d(
+        // Grid sizes:
+        //   accum  – one thread per (window, chunk)
+        //   merge  – one *block* of MERGE_BLOCK_SIZE threads per (window, bucket)
+        //   reduc  – one thread per window
+        //   combine– one thread for the single MSM result
+        let accum_gx = ((prepared.effective_windows * prepared.num_chunks) as u32 + 255) / 256;
+        let merge_gx = (prepared.effective_windows * prepared.num_buckets) as u32;
+        let reduc_gx = (prepared.effective_windows as u32 + 255) / 256;
+
+        self.state.execute_kernels_2d(
             &[
-                ("bucket_accumulation_by_chunk", accum_bufs, prepared.accum_blocks as u64),
-                ("bucket_merge",                 merge_bufs, prepared.merge_threads),
-                ("bucket_reduction",             reduc_bufs, prepared.effective_windows as u64),
-                ("combine_windows_kernel",        combine_bufs, 1),
+                ("bucket_accumulation_by_chunk", accum_bufs, accum_gx,  256,              0),
+                ("bucket_merge",                 merge_bufs, merge_gx,  MERGE_BLOCK_SIZE, MERGE_SHM_BYTES),
+                ("bucket_reduction",             reduc_bufs, reduc_gx,  256,              0),
+                ("combine_windows_kernel",       combine_bufs, 1,       256,              0),
             ],
             1,
         )?;
 
         self.state.read_buffer(&prepared.result_buf, LIMBS_PER_POINT)
+    }
+
+    // ─── persistent-bases API ────────────────────────────────────────────
+
+    /// Upload affine input points to GPU memory for repeated reuse.
+    ///
+    /// `points` is flat `[x0_l0..l3, y0_l0..l3, x1_l0..l3, …]` in Montgomery form.
+    /// Call this once per unique point set; then call [`compute_with_bases`] for
+    /// each new set of scalars without paying the PCIe transfer cost again.
+    pub fn prepare_bases(&mut self, points: &[u64]) -> HipResult<HipPippengerBases> {
+        if !self.initialized {
+            self.initialize()?;
+        }
+        if points.is_empty() {
+            return Err(HipError::EmptyInput);
+        }
+        if points.len() % LIMBS_PER_AFFINE != 0 {
+            return Err(HipError::InvalidInputSize {
+                expected: LIMBS_PER_AFFINE,
+                actual: points.len(),
+            });
+        }
+        let num_points = points.len() / LIMBS_PER_AFFINE;
+        let points_buf = self.state.alloc_buffer_with_data(points)?;
+        let field_buf  = self.field_params_buffer()?;
+        Ok(HipPippengerBases { points_buf, field_buf, num_points })
+    }
+
+    /// Compute `Σ scalars[i] * bases[i]` using pre-uploaded bases.
+    ///
+    /// Derives the optimal `window_size` and `chunk_size` from `bases.num_points`
+    /// without mutating `self.config`.  Only scalars are transferred to the GPU.
+    pub fn compute_with_bases(
+        &mut self,
+        scalars: &[u64],
+        bases: &HipPippengerBases,
+    ) -> HipResult<Vec<u64>> {
+        if !self.initialized {
+            self.initialize()?;
+        }
+        if scalars.len() % self.config.scalar_limbs != 0 {
+            return Err(HipError::InvalidInputSize {
+                expected: self.config.scalar_limbs,
+                actual: scalars.len(),
+            });
+        }
+        let num_scalars = scalars.len() / self.config.scalar_limbs;
+        if num_scalars == 0 {
+            return Err(HipError::EmptyInput);
+        }
+        if num_scalars != bases.num_points {
+            return Err(HipError::LengthMismatch(num_scalars, bases.num_points));
+        }
+
+        // Derive optimal config without mutating self.config.
+        let config           = self.config_for_num_points(bases.num_points);
+        let num_windows      = config.num_windows();
+        let effective_windows = num_windows + 1;
+        let num_buckets      = config.num_buckets();
+        let num_chunks       = num_scalars.div_ceil(config.chunk_size);
+
+        // Only scalars need to be encoded and uploaded.
+        let signed_digits = recode_scalars_signed(&config, scalars, num_scalars);
+        let digits_buf    = self.state.alloc_buffer_with_data(&signed_digits)?;
+
+        // Workspace buffers.
+        let partial_len = effective_windows * num_chunks * num_buckets * LIMBS_PER_POINT;
+        let partial_buckets_buf =
+            self.state.alloc_buffer(partial_len * std::mem::size_of::<u64>())?;
+
+        let buckets_len = effective_windows * num_buckets * LIMBS_PER_POINT;
+        let buckets_buf =
+            self.state.alloc_buffer(buckets_len * std::mem::size_of::<u64>())?;
+
+        let window_sums_buf = self.state.alloc_buffer(
+            effective_windows * LIMBS_PER_POINT * std::mem::size_of::<u64>(),
+        )?;
+
+        let result_buf = self.state.alloc_buffer(LIMBS_PER_POINT * std::mem::size_of::<u64>())?;
+
+        // Config buffers.
+        let accum_config_buf = self.state.alloc_buffer_with_data(&[
+            num_scalars as u32,
+            effective_windows as u32,
+            num_buckets as u32,
+            config.chunk_size as u32,
+            num_chunks as u32,
+        ])?;
+        let merge_config_buf = self.state.alloc_buffer_with_data(&[
+            effective_windows as u32,
+            num_buckets as u32,
+            num_chunks as u32,
+        ])?;
+        let reduction_config_buf = self
+            .state
+            .alloc_buffer_with_data(&[effective_windows as u32, num_buckets as u32])?;
+        let combine_config_buf = self.state.alloc_buffer_with_data(&[
+            effective_windows as u32,
+            config.window_size as u32,
+            1u32,
+        ])?;
+
+        let accum_bufs: &[&DeviceBuffer] = &[
+            &digits_buf, &bases.points_buf, &partial_buckets_buf,
+            &accum_config_buf, &bases.field_buf,
+        ];
+        let merge_bufs: &[&DeviceBuffer] = &[
+            &partial_buckets_buf, &buckets_buf, &merge_config_buf, &bases.field_buf,
+        ];
+        let reduc_bufs: &[&DeviceBuffer] = &[
+            &buckets_buf, &window_sums_buf, &reduction_config_buf, &bases.field_buf,
+        ];
+        let combine_bufs: &[&DeviceBuffer] = &[
+            &window_sums_buf, &result_buf, &combine_config_buf, &bases.field_buf,
+        ];
+
+        let accum_gx = ((effective_windows * num_chunks) as u32 + 255) / 256;
+        let merge_gx = (effective_windows * num_buckets) as u32;
+        let reduc_gx = (effective_windows as u32 + 255) / 256;
+
+        self.state.execute_kernels_2d(
+            &[
+                ("bucket_accumulation_by_chunk", accum_bufs, accum_gx,  256,              0),
+                ("bucket_merge",                 merge_bufs, merge_gx,  MERGE_BLOCK_SIZE, MERGE_SHM_BYTES),
+                ("bucket_reduction",             reduc_bufs, reduc_gx,  256,              0),
+                ("combine_windows_kernel",       combine_bufs, 1,       256,              0),
+            ],
+            1,
+        )?;
+
+        self.state.read_buffer(&result_buf, LIMBS_PER_POINT)
     }
 
     // ─── private helpers ──────────────────────────────────────────────────
@@ -504,61 +712,52 @@ impl HipPippengerMSM {
         self.state.alloc_buffer_with_data(&params)
     }
 
-    fn combine_windows(&self, window_sums: &[u64], num_windows: usize) -> Vec<u64> {
-        if num_windows == 0 {
-            return vec![0u64; LIMBS_PER_POINT];
-        }
-        let field = FieldParams {
-            modulus: self.config.field_modulus,
-            inv: self.config.montgomery_inv,
-        };
-        let mut result = JacobianPoint::from_limbs(
-            &window_sums[(num_windows - 1) * LIMBS_PER_POINT..num_windows * LIMBS_PER_POINT],
-        );
-        for window_idx in (0..num_windows - 1).rev() {
-            for _ in 0..self.config.window_size {
-                result = result.double(&field);
-            }
-            let base = window_idx * LIMBS_PER_POINT;
-            let w = JacobianPoint::from_limbs(&window_sums[base..base + LIMBS_PER_POINT]);
-            result = result.add(&w, &field);
-        }
-        result.to_limbs()
-    }
 }
 
 // ─── scalar recoding ──────────────────────────────────────────────────────────
 
+/// Recode 256-bit scalars into signed window digits using i8 storage.
+///
+/// Produces transposed layout: `digits[window_idx * num_scalars + scalar_idx]`.
+/// This lets the GPU load a tile of consecutive scalars for a fixed window in a
+/// single coalesced transaction.
+///
+/// For `window_size ≤ 7` the digit range is −64 .. +64, which fits in i8.
+/// `window_size = 4` (the default) produces −8 .. +8.
 fn recode_scalars_signed(
     config: &HipPippengerMSMConfig,
     scalars: &[u64],
     num_scalars: usize,
-) -> Vec<i32> {
+) -> Vec<i8> {
     let window_size = config.window_size;
-    let num_windows = config.num_windows();
-    let half_bucket = 1i32 << (window_size - 1);
-    let full_bucket = 1i32 << window_size;
-    let mask = (1u64 << window_size) - 1;
-    let effective_windows = num_windows + 1;
-    // Transposed layout: digits[window_idx * num_scalars + scalar_idx]
-    // This allows the GPU kernel to load a tile of consecutive scalars for a
-    // fixed window in a single coalesced transaction (vs. strided in the old layout).
-    let mut digits = vec![0i32; num_scalars * effective_windows];
+    debug_assert!(
+        window_size <= 7,
+        "i8 digit encoding requires window_size ≤ 7 (got {})",
+        window_size
+    );
+    let num_windows   = config.num_windows();
+    let half_bucket   = 1i32 << (window_size - 1);
+    let full_bucket   = 1i32 << window_size;
+    let mask          = (1u64 << window_size) - 1;
+    let eff_windows   = num_windows + 1;
+
+    let mut digits = vec![0i8; num_scalars * eff_windows];
 
     for scalar_idx in 0..num_scalars {
         let scalar_base = scalar_idx * config.scalar_limbs;
-        let mut carry = 0i32;
+        let mut carry   = 0i32;
 
         for window_idx in 0..num_windows {
-            let bit_offset = window_idx * window_size;
-            let limb_idx = bit_offset / 64;
+            let bit_offset  = window_idx * window_size;
+            let limb_idx    = bit_offset / 64;
             let bit_in_limb = bit_offset % 64;
 
             let raw_val = if limb_idx < config.scalar_limbs {
                 let mut val = (scalars[scalar_base + limb_idx] >> bit_in_limb) & mask;
                 if bit_in_limb + window_size > 64 && limb_idx + 1 < config.scalar_limbs {
                     let remaining = bit_in_limb + window_size - 64;
-                    val |= (scalars[scalar_base + limb_idx + 1] & ((1u64 << remaining) - 1))
+                    val |= (scalars[scalar_base + limb_idx + 1]
+                        & ((1u64 << remaining) - 1))
                         << (64 - bit_in_limb);
                 }
                 val
@@ -574,24 +773,27 @@ fn recode_scalars_signed(
                 carry = 0;
                 window_val
             };
-            // Transposed: [window][scalar]
-            digits[window_idx * num_scalars + scalar_idx] = digit;
+
+            // Transposed layout: [window][scalar]
+            digits[window_idx * num_scalars + scalar_idx] = digit as i8;
         }
-        digits[num_windows * num_scalars + scalar_idx] = carry;
+        digits[num_windows * num_scalars + scalar_idx] = carry as i8;
     }
 
     digits
 }
 
 // ─── CPU-side field/point arithmetic ─────────────────────────────────────────
-// Used only by unit tests (combine_windows has moved to the GPU kernel).
+// Used only by the unit tests below (the `combine_windows` step now runs on GPU).
 
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 struct FieldParams {
     modulus: [u64; COORD_LIMBS],
     inv: u64,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct JacobianPoint {
     x: [u64; COORD_LIMBS],
@@ -599,6 +801,7 @@ struct JacobianPoint {
     z: [u64; COORD_LIMBS],
 }
 
+#[allow(dead_code)]
 impl JacobianPoint {
     fn identity() -> Self {
         Self {
@@ -696,6 +899,7 @@ impl JacobianPoint {
     }
 }
 
+#[allow(dead_code)]
 fn bigint_add(a: &[u64; COORD_LIMBS], b: &[u64; COORD_LIMBS]) -> ([u64; COORD_LIMBS], u64) {
     let mut result = [0u64; COORD_LIMBS];
     let mut carry = 0u64;
@@ -708,6 +912,7 @@ fn bigint_add(a: &[u64; COORD_LIMBS], b: &[u64; COORD_LIMBS]) -> ([u64; COORD_LI
     (result, carry)
 }
 
+#[allow(dead_code)]
 fn bigint_sub(a: &[u64; COORD_LIMBS], b: &[u64; COORD_LIMBS]) -> ([u64; COORD_LIMBS], u64) {
     let mut result = [0u64; COORD_LIMBS];
     let mut borrow = 0u64;
@@ -720,21 +925,25 @@ fn bigint_sub(a: &[u64; COORD_LIMBS], b: &[u64; COORD_LIMBS]) -> ([u64; COORD_LI
     (result, borrow)
 }
 
+#[allow(dead_code)]
 fn field_add(a: &[u64; COORD_LIMBS], b: &[u64; COORD_LIMBS], f: &FieldParams) -> [u64; COORD_LIMBS] {
     let (sum, carry) = bigint_add(a, b);
     let (reduced, borrow) = bigint_sub(&sum, &f.modulus);
     if carry != 0 || borrow == 0 { reduced } else { sum }
 }
 
+#[allow(dead_code)]
 fn field_sub(a: &[u64; COORD_LIMBS], b: &[u64; COORD_LIMBS], f: &FieldParams) -> [u64; COORD_LIMBS] {
     let (diff, borrow) = bigint_sub(a, b);
     if borrow != 0 { bigint_add(&diff, &f.modulus).0 } else { diff }
 }
 
+#[allow(dead_code)]
 fn field_double(a: &[u64; COORD_LIMBS], f: &FieldParams) -> [u64; COORD_LIMBS] {
     field_add(a, a, f)
 }
 
+#[allow(dead_code)]
 fn mont_reduce(t: &[u64; COORD_LIMBS * 2], f: &FieldParams) -> [u64; COORD_LIMBS] {
     let mut tmp = *t;
     for i in 0..COORD_LIMBS {
@@ -764,6 +973,7 @@ fn mont_reduce(t: &[u64; COORD_LIMBS * 2], f: &FieldParams) -> [u64; COORD_LIMBS
     if borrow == 0 { reduced } else { result }
 }
 
+#[allow(dead_code)]
 fn mont_mul(a: &[u64; COORD_LIMBS], b: &[u64; COORD_LIMBS], f: &FieldParams) -> [u64; COORD_LIMBS] {
     let mut product = [0u64; COORD_LIMBS * 2];
     for i in 0..COORD_LIMBS {
@@ -783,6 +993,7 @@ fn mont_mul(a: &[u64; COORD_LIMBS], b: &[u64; COORD_LIMBS], f: &FieldParams) -> 
     mont_reduce(&product, f)
 }
 
+#[allow(dead_code)]
 fn mont_square(a: &[u64; COORD_LIMBS], f: &FieldParams) -> [u64; COORD_LIMBS] {
     mont_mul(a, a, f)
 }
@@ -858,8 +1069,10 @@ mod tests {
         };
         let scalars = [u64::MAX; COORD_LIMBS];
         let digits = recode_scalars_signed(&config, &scalars, 1);
+        // effective_windows = num_windows + 1 (carry window)
         assert_eq!(digits.len(), config.num_windows() + 1);
-        assert_eq!(*digits.last().unwrap(), 1);
+        // carry propagates to the last (extra) window
+        assert_eq!(*digits.last().unwrap(), 1i8);
     }
 
     #[test]
