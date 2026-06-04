@@ -351,10 +351,28 @@ impl HipState {
         kernels: &[(&str, &[&DeviceBuffer], u64)],
         grid_y: u32,
     ) -> HipResult<()> {
-        for (name, buffers, thread_count) in kernels {
+        let mapped: Vec<(&str, &[&DeviceBuffer], u32, u32, u32)> = kernels
+            .iter()
+            .map(|(n, b, tc)| {
+                let bs: u32 = 256;
+                let gx = ((*tc as u32) + bs - 1) / bs;
+                (*n, *b, gx, bs, 0u32)
+            })
+            .collect();
+        self.execute_kernels_2d(&mapped, grid_y)
+    }
+
+    /// Low-level 2-D kernel launch sequence.
+    ///
+    /// Each tuple: `(name, buffers, grid_x, block_size, shared_mem_bytes)`.
+    /// `grid_y` is the second grid dimension (1 for single-MSM).
+    pub fn execute_kernels_2d(
+        &mut self,
+        kernels: &[(&str, &[&DeviceBuffer], u32, u32, u32)],
+        grid_y: u32,
+    ) -> HipResult<()> {
+        for (name, buffers, grid_x, block_size, shared_mem) in kernels {
             let func = self.get_function(name)?;
-            let block_size: u32 = 256;
-            let grid_x: u32 = ((*thread_count as u32) + block_size - 1) / block_size;
 
             // Build the kernel-params array: one void* per buffer (device ptr).
             let mut ptrs: Vec<*mut std::ffi::c_void> =
@@ -367,9 +385,9 @@ impl HipState {
             let code = unsafe {
                 hipModuleLaunchKernel(
                     func,
-                    grid_x, grid_y, 1,
-                    block_size, 1, 1,
-                    0,
+                    *grid_x, grid_y, 1,
+                    *block_size, 1, 1,
+                    *shared_mem,
                     std::ptr::null_mut(), // default stream
                     kernel_params.as_mut_ptr(),
                     std::ptr::null_mut(),

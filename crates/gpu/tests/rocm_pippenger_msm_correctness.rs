@@ -30,7 +30,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
 const SEED: [u8; 32] = [0x42; 32];
-const WINDOW_SIZE: usize = 8;
+const WINDOW_SIZE: usize = 4; // capped by MAX_PRIVATE_BUCKETS kernel limit
 const TEST_SIZES: &[usize] = &[2, 8, 32];
 
 type Scalar = UnsignedInteger<4>;

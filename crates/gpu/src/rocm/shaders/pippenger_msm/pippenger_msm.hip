@@ -5,15 +5,18 @@
 // This reduces H→D transfer and HBM read traffic by 33%.
 //
 // Kernels:
-//   clear_u64_buffer              – zero a u64 device buffer
 //   bucket_accumulation_by_chunk  – signed-digit bucket accumulation
 //   bucket_merge                  – merge per-chunk partial buckets
 //   bucket_reduction              – triangle sum reduction per window
 //
-// Bucket accumulation has two sub-paths depending on num_buckets:
-//   ≤ MAX_PRIVATE_BUCKETS (64)  – fast path: buckets in registers
-//   ≤ MAX_SHARED_BUCKETS  (512) – medium path: buckets in shared memory (LDS)
-//   > 512                       – slow path: buckets in global memory
+// Design: one THREAD per (window, chunk) pair.  Each thread holds all buckets
+// as private register variables.  To avoid VGPR spilling on RDNA3 (256 VGPR/lane
+// limit), the caller must cap window_size ≤ 4 → num_buckets ≤ 8:
+//   8 × 12 u64 = 192 VGPRs  <  256  →  zero spilling.
+//
+// Digits layout (transposed): [msm_idx][window_idx * num_scalars + point_idx]
+// → for a fixed (window, chunk), consecutive gids read consecutive digit words
+//   → coalesced L2 / L1 access.
 //
 // Batch MSM: blockIdx.y selects the MSM within a batch.
 // Single-MSM callers set grid_dim_y = 1.
@@ -22,8 +25,7 @@
 #define COORDS_PER_POINT 3
 #define LIMBS_PER_POINT  (NUM_LIMBS * COORDS_PER_POINT)   // 12 – Jacobian bucket format
 #define LIMBS_PER_AFFINE (NUM_LIMBS * 2)                  //  8 – affine input point format
-#define MAX_PRIVATE_BUCKETS 64
-#define MAX_SHARED_BUCKETS  512
+#define MAX_PRIVATE_BUCKETS 8   // window_size=4 → num_buckets=8 → 192 VGPRs (fits RDNA3)
 
 typedef unsigned long long u64limb;
 typedef unsigned int       uint;
@@ -101,86 +103,91 @@ __device__ FieldParams load_field(const u64limb* __restrict__ params) {
     return f;
 }
 
-// ─── field arithmetic (Montgomery) ─────────────────────────────────────────
+// ─── Montgomery field arithmetic ─────────────────────────────────────────────
 
-__device__ BigInt field_add(BigInt a, BigInt b, FieldParams field) {
-    auto [sum, carry] = bigint_add(a, b);
-    auto [reduced, borrow] = bigint_sub(sum, field.modulus);
-    return (carry != 0 || borrow == 0) ? reduced : sum;
-}
+__device__ BigInt mont_mul(BigInt a, BigInt b, FieldParams f) {
+    BigIntWide t;
+    for (uint i = 0; i < NUM_LIMBS * 2; i++) t.limbs[i] = 0;
 
-__device__ BigInt field_sub(BigInt a, BigInt b, FieldParams field) {
-    auto [diff, borrow] = bigint_sub(a, b);
-    if (borrow != 0) {
-        auto [corrected, _] = bigint_add(diff, field.modulus);
-        return corrected;
+    for (uint i = 0; i < NUM_LIMBS; i++) {
+        u64limb carry = 0;
+        for (uint j = 0; j < NUM_LIMBS; j++) {
+            u64limb lo  = a.limbs[i] * b.limbs[j];
+            u64limb hi  = mulhi_u64(a.limbs[i], b.limbs[j]);
+            u64limb s1  = t.limbs[i + j] + lo;
+            u64limb c1  = (s1 < t.limbs[i + j]) ? 1ULL : 0ULL;
+            u64limb s2  = s1 + carry;
+            u64limb c2  = (s2 < s1) ? 1ULL : 0ULL;
+            t.limbs[i + j] = s2;
+            carry = hi + c1 + c2;
+        }
+        t.limbs[i + NUM_LIMBS] += carry;
     }
-    return diff;
-}
 
-__device__ BigInt field_neg(BigInt a, FieldParams field) {
-    if (bigint_is_zero(a)) return a;
-    auto [result, _] = bigint_sub(field.modulus, a);
+    for (uint i = 0; i < NUM_LIMBS; i++) {
+        u64limb m = t.limbs[i] * f.inv;
+        u64limb carry = 0;
+        for (uint j = 0; j < NUM_LIMBS; j++) {
+            u64limb lo  = m * f.modulus.limbs[j];
+            u64limb hi  = mulhi_u64(m, f.modulus.limbs[j]);
+            u64limb s1  = t.limbs[i + j] + lo;
+            u64limb c1  = (s1 < t.limbs[i + j]) ? 1ULL : 0ULL;
+            u64limb s2  = s1 + carry;
+            u64limb c2  = (s2 < s1) ? 1ULL : 0ULL;
+            t.limbs[i + j] = s2;
+            carry = hi + c1 + c2;
+        }
+        u64limb s = t.limbs[i + NUM_LIMBS] + carry;
+        u64limb c = (s < t.limbs[i + NUM_LIMBS]) ? 1ULL : 0ULL;
+        t.limbs[i + NUM_LIMBS] = s;
+        if (i + NUM_LIMBS + 1 < NUM_LIMBS * 2)
+            t.limbs[i + NUM_LIMBS + 1] += c;
+    }
+
+    BigInt result;
+    for (uint i = 0; i < NUM_LIMBS; i++) result.limbs[i] = t.limbs[i + NUM_LIMBS];
+
+    // Conditional subtraction if result ≥ modulus.
+    BigIntSubResult sub = bigint_sub(result, f.modulus);
+    if (!sub.borrow) result = sub.result;
     return result;
 }
 
-__device__ BigInt field_double(BigInt a, FieldParams field) {
-    return field_add(a, a, field);
+__device__ BigInt mont_square(BigInt a, FieldParams f) {
+    return mont_mul(a, a, f);
 }
 
-__device__ BigInt mont_reduce(BigIntWide t, FieldParams field) {
-    BigIntWide tmp = t;
-    for (uint i = 0; i < NUM_LIMBS; i++) {
-        u64limb m = tmp.limbs[i] * field.inv;
-        u64limb carry = 0;
-        for (uint j = 0; j < NUM_LIMBS; j++) {
-            u64limb lo = m * field.modulus.limbs[j];
-            u64limb hi = mulhi_u64(m, field.modulus.limbs[j]);
-            u64limb s1 = tmp.limbs[i + j] + lo;
-            u64limb c1 = (s1 < tmp.limbs[i + j]) ? 1ULL : 0ULL;
-            u64limb s2 = s1 + carry;
-            u64limb c2 = (s2 < s1) ? 1ULL : 0ULL;
-            tmp.limbs[i + j] = s2;
-            carry = hi + c1 + c2;
-        }
-        for (uint j = NUM_LIMBS; i + j < NUM_LIMBS * 2; j++) {
-            u64limb s = tmp.limbs[i + j] + carry;
-            carry = (s < tmp.limbs[i + j]) ? 1ULL : 0ULL;
-            tmp.limbs[i + j] = s;
-            if (carry == 0) break;
-        }
+__device__ BigInt field_add(BigInt a, BigInt b, FieldParams f) {
+    BigIntAddResult r = bigint_add(a, b);
+    BigInt result = r.result;
+    if (r.carry) {
+        BigIntSubResult s = bigint_sub(result, f.modulus);
+        return s.result;
     }
-    BigInt result;
-    for (uint i = 0; i < NUM_LIMBS; i++) result.limbs[i] = tmp.limbs[i + NUM_LIMBS];
-    auto [reduced, borrow] = bigint_sub(result, field.modulus);
-    return (borrow == 0) ? reduced : result;
+    BigIntSubResult s = bigint_sub(result, f.modulus);
+    return s.borrow ? result : s.result;
 }
 
-__device__ BigInt mont_mul(BigInt a, BigInt b, FieldParams field) {
-    BigIntWide product;
-    for (uint i = 0; i < NUM_LIMBS * 2; i++) product.limbs[i] = 0;
-    for (uint i = 0; i < NUM_LIMBS; i++) {
-        u64limb carry = 0;
-        for (uint j = 0; j < NUM_LIMBS; j++) {
-            u64limb lo = a.limbs[i] * b.limbs[j];
-            u64limb hi = mulhi_u64(a.limbs[i], b.limbs[j]);
-            u64limb s1 = product.limbs[i + j] + lo;
-            u64limb c1 = (s1 < product.limbs[i + j]) ? 1ULL : 0ULL;
-            u64limb s2 = s1 + carry;
-            u64limb c2 = (s2 < s1) ? 1ULL : 0ULL;
-            product.limbs[i + j] = s2;
-            carry = hi + c1 + c2;
-        }
-        product.limbs[i + NUM_LIMBS] += carry;
+__device__ BigInt field_double(BigInt a, FieldParams f) {
+    return field_add(a, a, f);
+}
+
+__device__ BigInt field_sub(BigInt a, BigInt b, FieldParams f) {
+    BigIntSubResult r = bigint_sub(a, b);
+    if (r.borrow) {
+        BigIntAddResult s = bigint_add(r.result, f.modulus);
+        return s.result;
     }
-    return mont_reduce(product, field);
+    return r.result;
 }
 
-__device__ BigInt mont_square(BigInt a, FieldParams field) {
-    return mont_mul(a, a, field);
+__device__ BigInt field_neg(BigInt a, FieldParams f) {
+    if (bigint_is_zero(a)) return a;
+    BigIntSubResult r = bigint_sub(f.modulus, a);
+    return r.result;
 }
 
-// ─── Jacobian point operations ──────────────────────────────────────────────
+// ─── Jacobian point operations ────────────────────────────────────────────────
 
 __device__ JacobianPoint jacobian_identity() {
     JacobianPoint p;
@@ -210,9 +217,9 @@ __device__ JacobianPoint jacobian_double(JacobianPoint p, FieldParams field) {
     result.x = field_sub(F, field_double(D, field), field);
     result.y = field_sub(
         mont_mul(E, field_sub(D, result.x, field), field),
-        field_double(field_double(field_double(C, field), field), field),
+        field_add(C, field_add(C, field_add(C, field_add(C, field_add(C, field_add(C, field_double(C, field), field), field), field), field), field), field),
         field);
-    result.z = field_double(mont_mul(p.y, p.z, field), field);
+    result.z = mont_mul(field_double(p.y, field), p.z, field);
     return result;
 }
 
@@ -221,19 +228,19 @@ __device__ JacobianPoint jacobian_add(JacobianPoint p, JacobianPoint q, FieldPar
     if (jacobian_is_identity(q)) return p;
     BigInt Z1Z1 = mont_square(p.z, field);
     BigInt Z2Z2 = mont_square(q.z, field);
-    BigInt U1 = mont_mul(p.x, Z2Z2, field);
-    BigInt U2 = mont_mul(q.x, Z1Z1, field);
-    BigInt S1 = mont_mul(mont_mul(p.y, q.z, field), Z2Z2, field);
-    BigInt S2 = mont_mul(mont_mul(q.y, p.z, field), Z1Z1, field);
-    BigInt H  = field_sub(U2, U1, field);
+    BigInt U1   = mont_mul(p.x, Z2Z2, field);
+    BigInt U2   = mont_mul(q.x, Z1Z1, field);
+    BigInt S1   = mont_mul(mont_mul(p.y, q.z, field), Z2Z2, field);
+    BigInt S2   = mont_mul(mont_mul(q.y, p.z, field), Z1Z1, field);
+    BigInt H    = field_sub(U2, U1, field);
     if (bigint_is_zero(H)) {
         if (bigint_is_zero(field_sub(S2, S1, field))) return jacobian_double(p, field);
         return jacobian_identity();
     }
-    BigInt I = mont_square(field_double(H, field), field);
-    BigInt J = mont_mul(H, I, field);
-    BigInt r = field_double(field_sub(S2, S1, field), field);
-    BigInt V = mont_mul(U1, I, field);
+    BigInt I   = mont_square(field_double(H, field), field);
+    BigInt J   = mont_mul(H, I, field);
+    BigInt r   = field_double(field_sub(S2, S1, field), field);
+    BigInt V   = mont_mul(U1, I, field);
     JacobianPoint result;
     result.x = field_sub(field_sub(mont_square(r, field), J, field), field_double(V, field), field);
     result.y = field_sub(
@@ -241,13 +248,11 @@ __device__ JacobianPoint jacobian_add(JacobianPoint p, JacobianPoint q, FieldPar
         field_double(mont_mul(S1, J, field), field),
         field);
     result.z = mont_mul(
-        field_sub(field_sub(mont_square(field_add(p.z, q.z, field), field), Z1Z1, field), Z2Z2, field),
+        mont_mul(field_double(p.z, field), q.z, field),
         H, field);
     return result;
 }
 
-// Mixed addition: p is Jacobian bucket, q is affine input (z = mont_one).
-// q.z is passed implicitly via field.mont_one — not stored in the input buffer.
 __device__ JacobianPoint jacobian_add_mixed(JacobianPoint p, JacobianPoint q, FieldParams field) {
     if (jacobian_is_identity(p)) return q;
     if (jacobian_is_identity(q)) return p;
@@ -301,41 +306,18 @@ __device__ JacobianPoint load_jacobian_point(const u64limb* __restrict__ points,
     for (uint i = 0; i < NUM_LIMBS; i++) {
         p.x.limbs[i] = points[base + i];
         p.y.limbs[i] = points[base + NUM_LIMBS + i];
-        p.z.limbs[i] = points[base + 2 * NUM_LIMBS + i];
+        p.z.limbs[i] = points[base + NUM_LIMBS * 2 + i];
     }
     return p;
 }
 
-__device__ void store_jacobian_point(u64limb* points, uint point_idx, JacobianPoint p) {
+// Store a Jacobian point (12 limbs).
+__device__ void store_jacobian_point(u64limb* __restrict__ points, uint point_idx, JacobianPoint p) {
     uint base = point_idx * LIMBS_PER_POINT;
     for (uint i = 0; i < NUM_LIMBS; i++) {
-        points[base + i]                 = p.x.limbs[i];
-        points[base + NUM_LIMBS + i]     = p.y.limbs[i];
-        points[base + 2 * NUM_LIMBS + i] = p.z.limbs[i];
-    }
-}
-
-// ─── shared-memory helpers ────────────────────────────────────────────────────
-
-// Store/load a Jacobian point from a shared-memory bucket array.
-// `shared_buckets` has layout [bucket_idx * LIMBS_PER_POINT + limb_idx].
-__device__ JacobianPoint load_shared_point(__shared__ u64limb* shared_buckets, uint bucket_idx) {
-    uint base = bucket_idx * LIMBS_PER_POINT;
-    JacobianPoint p;
-    for (uint i = 0; i < NUM_LIMBS; i++) {
-        p.x.limbs[i] = shared_buckets[base + i];
-        p.y.limbs[i] = shared_buckets[base + NUM_LIMBS + i];
-        p.z.limbs[i] = shared_buckets[base + 2 * NUM_LIMBS + i];
-    }
-    return p;
-}
-
-__device__ void store_shared_point(__shared__ u64limb* shared_buckets, uint bucket_idx, JacobianPoint p) {
-    uint base = bucket_idx * LIMBS_PER_POINT;
-    for (uint i = 0; i < NUM_LIMBS; i++) {
-        shared_buckets[base + i]                 = p.x.limbs[i];
-        shared_buckets[base + NUM_LIMBS + i]     = p.y.limbs[i];
-        shared_buckets[base + 2 * NUM_LIMBS + i] = p.z.limbs[i];
+        points[base + i]                = p.x.limbs[i];
+        points[base + NUM_LIMBS + i]    = p.y.limbs[i];
+        points[base + NUM_LIMBS * 2 + i] = p.z.limbs[i];
     }
 }
 
@@ -343,19 +325,16 @@ __device__ void store_shared_point(__shared__ u64limb* shared_buckets, uint buck
 //
 // blockIdx.y = MSM index within a batch.  Single-MSM callers set grid_dim_y = 1.
 
-extern "C" __global__ void clear_u64_buffer(
-    u64limb*     __restrict__ buffer,
-    const uint*  __restrict__ config
-) {
-    uint gid = blockIdx.x * blockDim.x + threadIdx.x;
-    uint len = config[0];
-    if (gid < len) buffer[gid] = 0;
-}
-
 // Bucket accumulation.
 //
-// Each thread handles one (window, chunk) pair and accumulates all points in
-// that chunk into a private or shared bucket set, then flushes to global memory.
+// One THREAD per (window, chunk) pair.  Each thread accumulates all points in
+// its chunk into a private array of num_buckets Jacobian points (registers).
+//
+// Caller must ensure window_size ≤ 4 → num_buckets ≤ MAX_PRIVATE_BUCKETS (8):
+//   8 × 12 u64 = 192 VGPRs  <  256 VGPR/lane limit (RDNA3) → zero spilling.
+//
+// Digits: transposed layout [msm][window * num_scalars + scalar]
+// → consecutive gids load consecutive digit words → coalesced L2/L1 access.
 //
 // config: [num_scalars, num_windows, num_buckets, chunk_size, num_chunks]
 extern "C" __global__ void bucket_accumulation_by_chunk(
@@ -372,110 +351,40 @@ extern "C" __global__ void bucket_accumulation_by_chunk(
     uint num_buckets = config[2];
     uint chunk_size  = config[3];
     uint num_chunks  = config[4];
-    uint total_workers = num_windows * num_chunks;
 
-    if (gid >= total_workers) return;
+    if (gid >= num_windows * num_chunks) return;
 
     uint window_idx = gid / num_chunks;
     uint chunk_idx  = gid % num_chunks;
     uint start      = chunk_idx * chunk_size;
     uint end        = (start + chunk_size < num_scalars) ? (start + chunk_size) : num_scalars;
 
-    // Per-MSM offsets — points use LIMBS_PER_AFFINE (8), partial_buckets use LIMBS_PER_POINT (12).
-    uint msm_digits_off  = msm_idx * (num_scalars * num_windows);
-    uint msm_points_off  = msm_idx * num_scalars;  // in affine-point units
-    uint msm_partial_off = msm_idx * (num_windows * num_chunks * num_buckets);
-    uint partial_base    = msm_partial_off + (window_idx * num_chunks + chunk_idx) * num_buckets;
+    // Per-MSM offsets.
+    // Digits: transposed layout [msm][window * num_scalars + scalar]
+    uint msm_digits_off    = msm_idx * (num_windows * num_scalars);
+    uint msm_points_off    = msm_idx * num_scalars;  // in affine-point units
+    uint msm_partial_off   = msm_idx * (num_windows * num_chunks * num_buckets);
+    uint partial_base      = msm_partial_off + (window_idx * num_chunks + chunk_idx) * num_buckets;
+    uint window_digit_base = msm_digits_off + window_idx * num_scalars;
 
     FieldParams field = load_field(field_params);
 
-    // ── Fast path: private register buckets (num_buckets ≤ MAX_PRIVATE_BUCKETS) ──
-    if (num_buckets <= MAX_PRIVATE_BUCKETS) {
-        JacobianPoint local_buckets[MAX_PRIVATE_BUCKETS];
-        for (uint b = 0; b < num_buckets; b++) local_buckets[b] = jacobian_identity();
+    // Private register buckets.  num_buckets ≤ MAX_PRIVATE_BUCKETS = 8 → no VGPR spill.
+    JacobianPoint local_buckets[MAX_PRIVATE_BUCKETS];
+    for (uint b = 0; b < num_buckets; b++) local_buckets[b] = jacobian_identity();
 
-        for (uint s = start; s < end; s++) {
-            int digit = digits[msm_digits_off + s * num_windows + window_idx];
-            if (digit == 0) continue;
-            uint bucket_idx = (digit > 0) ? (uint)(digit - 1) : (uint)(-digit - 1);
-            JacobianPoint p = load_affine_point(points, msm_points_off + s, field.mont_one);
-            if (digit < 0) p = jacobian_neg(p, field);
-            local_buckets[bucket_idx] = jacobian_add_mixed(local_buckets[bucket_idx], p, field);
-        }
-
-        for (uint b = 0; b < num_buckets; b++)
-            store_jacobian_point(partial_buckets, partial_base + b, local_buckets[b]);
-        return;
-    }
-
-    // ── Medium path: shared memory (LDS) buckets (num_buckets ≤ MAX_SHARED_BUCKETS) ──
-    // Each block handles exactly one (window, chunk) pair.
-    // All threads in the block cooperate: each thread owns a stripe of buckets.
-    if (num_buckets <= MAX_SHARED_BUCKETS) {
-        __shared__ u64limb shared_buckets[MAX_SHARED_BUCKETS * LIMBS_PER_POINT];
-
-        // Initialise shared buckets to identity — each thread clears its stripe.
-        uint lim = LIMBS_PER_POINT * num_buckets;
-        for (uint i = threadIdx.x; i < lim; i += blockDim.x)
-            shared_buckets[i] = 0ULL;
-        __syncthreads();
-
-        // Each thread processes a subset of points in the chunk, writing to shared memory.
-        // Points are partitioned among threads to avoid write conflicts on the same bucket.
-        // Strategy: thread t processes points at offsets t, t+blockDim.x, t+2*blockDim.x, ...
-        // Multiple threads may write to the same bucket → we use a sequential pass per-bucket-stripe.
-        //
-        // Simpler correct strategy: each thread handles a strided subset of the chunk.
-        // Since multiple threads can hit the same bucket we use per-thread private accumulators
-        // for a stripe of the bucket space, then reduce into shared memory.
-        //
-        // Thread t owns buckets in [t*stripe, (t+1)*stripe).
-        uint stripe = (num_buckets + blockDim.x - 1) / blockDim.x;
-        uint b_start = threadIdx.x * stripe;
-        uint b_end   = (b_start + stripe < num_buckets) ? (b_start + stripe) : num_buckets;
-
-        // Private accumulators for this thread's stripe (up to stripe buckets).
-        // Maximum stripe = MAX_SHARED_BUCKETS / 256 = 2 when blockDim.x=256.
-        // We allow up to 4 private buckets per thread in the medium path.
-        JacobianPoint stripe_buckets[MAX_SHARED_BUCKETS / 256 + 1];
-        for (uint b = 0; b < stripe && b < (MAX_SHARED_BUCKETS / 256 + 1); b++)
-            stripe_buckets[b] = jacobian_identity();
-
-        for (uint s = start; s < end; s++) {
-            int digit = digits[msm_digits_off + s * num_windows + window_idx];
-            if (digit == 0) continue;
-            uint bucket_idx = (digit > 0) ? (uint)(digit - 1) : (uint)(-digit - 1);
-            if (bucket_idx < b_start || bucket_idx >= b_end) continue;
-            JacobianPoint p = load_affine_point(points, msm_points_off + s, field.mont_one);
-            if (digit < 0) p = jacobian_neg(p, field);
-            uint local_b = bucket_idx - b_start;
-            stripe_buckets[local_b] = jacobian_add_mixed(stripe_buckets[local_b], p, field);
-        }
-
-        // Write stripe results to shared memory.
-        for (uint b = b_start; b < b_end; b++)
-            store_shared_point(shared_buckets, b, stripe_buckets[b - b_start]);
-        __syncthreads();
-
-        // Flush shared buckets to global partial_buckets.
-        for (uint i = threadIdx.x; i < num_buckets; i += blockDim.x)
-            store_jacobian_point(partial_buckets, partial_base + i,
-                                 load_shared_point(shared_buckets, i));
-        return;
-    }
-
-    // ── Slow path: global memory buckets (large num_buckets) ──
     for (uint s = start; s < end; s++) {
-        int digit = digits[msm_digits_off + s * num_windows + window_idx];
+        // Transposed layout → adjacent gids hit adjacent memory locations → coalesced.
+        int digit = digits[window_digit_base + s];
         if (digit == 0) continue;
         uint bucket_idx = (digit > 0) ? (uint)(digit - 1) : (uint)(-digit - 1);
         JacobianPoint p = load_affine_point(points, msm_points_off + s, field.mont_one);
         if (digit < 0) p = jacobian_neg(p, field);
-        uint partial_idx = partial_base + bucket_idx;
-        JacobianPoint bucket = load_jacobian_point(partial_buckets, partial_idx);
-        bucket = jacobian_add_mixed(bucket, p, field);
-        store_jacobian_point(partial_buckets, partial_idx, bucket);
+        local_buckets[bucket_idx] = jacobian_add_mixed(local_buckets[bucket_idx], p, field);
     }
+
+    for (uint b = 0; b < num_buckets; b++)
+        store_jacobian_point(partial_buckets, partial_base + b, local_buckets[b]);
 }
 
 extern "C" __global__ void bucket_merge(

@@ -66,16 +66,12 @@ impl HipPippengerMSMConfig {
         }
     }
 
-    pub fn optimal_window_size(num_points: usize) -> usize {
-        // Cap at 7 so num_buckets = 2^(w-1) ≤ 64, fitting in the fast register path.
-        // The medium shared-memory path handles up to 512 buckets (window ≤ 10) but
-        // requires per-thread bucket striping which scales poorly; register path is fastest.
-        match num_points {
-            0..=4 => 2,
-            5..=32 => 4,
-            33..=256 => 6,
-            _ => 7,
-        }
+    pub fn optimal_window_size(_num_points: usize) -> usize {
+        // Capped at 4: num_buckets = 2^(4-1) = 8 → 8 × 12 u64 = 192 VGPRs per thread.
+        // RDNA3 allows 256 VGPRs/lane; staying under this limit eliminates register
+        // spilling to scratch memory, which was the dominant bottleneck at larger windows.
+        // A fixed window=4 simplifies tuning; all scalar sizes use the same path.
+        4
     }
 
     pub const MAX_WINDOW_SIZE: usize = 20;
@@ -137,8 +133,8 @@ pub struct PreparedHipPippengerMSM {
     merge_config_buf: DeviceBuffer,
     reduction_config_buf: DeviceBuffer,
     field_buf: DeviceBuffer,
-    clear_config_buf: DeviceBuffer,
-    accumulation_threads: u64,
+    /// Total threads for the accumulation kernel = effective_windows × num_chunks.
+    accum_blocks: u64,
     merge_threads: u64,
     effective_windows: usize,
 }
@@ -199,7 +195,6 @@ impl HipPippengerMSM {
         }
         self.state
             .load_source(PIPPENGER_MSM_HIP_SOURCE, "pippenger_msm.hip")?;
-        self.state.prepare_function("clear_u64_buffer")?;
         self.state
             .prepare_function("bucket_accumulation_by_chunk")?;
         self.state.prepare_function("bucket_merge")?;
@@ -284,8 +279,6 @@ impl HipPippengerMSM {
             .state
             .alloc_buffer_with_data(&[effective_windows as u32, num_buckets as u32])?;
         let field_buf = self.field_params_buffer()?;
-        let clear_config_buf =
-            self.state.alloc_buffer_with_data(&[partial_len as u32])?;
 
         Ok(PreparedHipPippengerMSM {
             digits_buf,
@@ -297,8 +290,7 @@ impl HipPippengerMSM {
             merge_config_buf,
             reduction_config_buf,
             field_buf,
-            clear_config_buf,
-            accumulation_threads: (effective_windows * num_chunks) as u64,
+            accum_blocks: (effective_windows * num_chunks) as u64,
             merge_threads: (effective_windows * num_buckets) as u64,
             effective_windows,
         })
@@ -356,10 +348,10 @@ impl HipPippengerMSM {
         let points_buf = self.state.alloc_buffer_with_data(&all_points_raw)?;
 
         // Allocate batch-sized intermediate buffers.
+        // No pre-zeroing needed: each thread initialises its own bucket to identity.
         let partial_len = num_msms * effective_windows * num_chunks * num_buckets * LIMBS_PER_POINT;
         let partial_buckets_buf =
             self.state.alloc_buffer(partial_len * std::mem::size_of::<u64>())?;
-        self.state.zero_buffer(&partial_buckets_buf)?;
 
         let buckets_len = num_msms * effective_windows * num_buckets * LIMBS_PER_POINT;
         let buckets_buf =
@@ -426,13 +418,7 @@ impl HipPippengerMSM {
         &mut self,
         prepared: &PreparedHipPippengerMSM,
     ) -> HipResult<Vec<u64>> {
-        let clear_threads =
-            (prepared.partial_buckets_buf.len_bytes() / std::mem::size_of::<u64>()) as u64;
-
-        let clear_bufs: &[&DeviceBuffer] = &[
-            &prepared.partial_buckets_buf,
-            &prepared.clear_config_buf,
-        ];
+        // No pre-clear: accumulation kernel initialises each bucket to identity.
         let accum_bufs: &[&DeviceBuffer] = &[
             &prepared.digits_buf,
             &prepared.points_buf,
@@ -453,20 +439,14 @@ impl HipPippengerMSM {
             &prepared.field_buf,
         ];
 
-        self.state.execute_compute_seq(&[
-            ("clear_u64_buffer", clear_bufs, clear_threads),
-            (
-                "bucket_accumulation_by_chunk",
-                accum_bufs,
-                prepared.accumulation_threads,
-            ),
-            ("bucket_merge", merge_bufs, prepared.merge_threads),
-            (
-                "bucket_reduction",
-                reduc_bufs,
-                prepared.effective_windows as u64,
-            ),
-        ])?;
+        self.state.execute_compute_seq_2d(
+            &[
+                ("bucket_accumulation_by_chunk", accum_bufs, prepared.accum_blocks as u64),
+                ("bucket_merge",                 merge_bufs, prepared.merge_threads),
+                ("bucket_reduction",             reduc_bufs, prepared.effective_windows as u64),
+            ],
+            1,
+        )?;
 
         let window_sums: Vec<u64> = self
             .state
@@ -523,6 +503,9 @@ fn recode_scalars_signed(
     let full_bucket = 1i32 << window_size;
     let mask = (1u64 << window_size) - 1;
     let effective_windows = num_windows + 1;
+    // Transposed layout: digits[window_idx * num_scalars + scalar_idx]
+    // This allows the GPU kernel to load a tile of consecutive scalars for a
+    // fixed window in a single coalesced transaction (vs. strided in the old layout).
     let mut digits = vec![0i32; num_scalars * effective_windows];
 
     for scalar_idx in 0..num_scalars {
@@ -554,9 +537,10 @@ fn recode_scalars_signed(
                 carry = 0;
                 window_val
             };
-            digits[scalar_idx * effective_windows + window_idx] = digit;
+            // Transposed: [window][scalar]
+            digits[window_idx * num_scalars + scalar_idx] = digit;
         }
-        digits[scalar_idx * effective_windows + num_windows] = carry;
+        digits[num_windows * num_scalars + scalar_idx] = carry;
     }
 
     digits
