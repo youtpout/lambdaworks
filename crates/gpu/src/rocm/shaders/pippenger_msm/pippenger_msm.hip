@@ -1,25 +1,51 @@
 // HIP (ROCm) Pippenger MSM for 256-bit short-Weierstrass curves (a = 0).
 //
-// Points are Jacobian (x, y, z) in Montgomery form for bucket storage, but
-// INPUT POINTS are affine (x, y only – 8 u64 limbs per point, not 12).
-// This reduces H→D transfer and HBM read traffic by 33%.
+// Compile with -DPALLAS_CURVE or -DVESTA_CURVE to activate the specialised
+// Montgomery multiply for those moduli.  Without either flag the code falls
+// back to the fully generic path.
+//
+// Specialisation targets the Pallas / Vesta modulus structure:
+//   modulus = [m0, m1, 0, 2^62]
+// This eliminates one multiply per reduction step (j=2, modulus=0) and
+// replaces another with a shift pair (j=3, modulus=2^62).  ~25 % fewer
+// multiplies in mont_mul → measurable throughput gain in bucket_accumulation.
 //
 // Kernels:
-//   bucket_accumulation_by_chunk  – signed-digit bucket accumulation
-//   bucket_merge                  – merge per-chunk partial buckets
-//   bucket_reduction              – triangle sum reduction per window
+//   bucket_accumulation_by_chunk – signed-digit bucket accumulation
+//   bucket_merge                 – parallel LDS merge of per-chunk partials
+//   bucket_reduce_combine        – fused triangle-sum + Horner window combine
 //
 // Design: one THREAD per (window, chunk) pair.  Each thread holds all buckets
-// as private register variables.  To avoid VGPR spilling on RDNA3 (256 VGPR/lane
-// limit), the caller must cap window_size ≤ 4 → num_buckets ≤ 8:
-//   8 × 12 u64 = 192 VGPRs  <  256  →  zero spilling.
+// as private register variables.  window_size ≤ 4 → num_buckets ≤ 8 → 192
+// VGPRs per thread < 256 VGPR/lane limit (RDNA3) → zero register spilling.
 //
 // Digits layout (transposed): [msm_idx][window_idx * num_scalars + point_idx]
-// → for a fixed (window, chunk), consecutive gids read consecutive digit words
-//   → coalesced L2 / L1 access.
+// → consecutive gids load consecutive digit words → coalesced L2/L1 access.
 //
-// Batch MSM: blockIdx.y selects the MSM within a batch.
-// Single-MSM callers set grid_dim_y = 1.
+// Batch MSM: blockIdx.y selects the MSM.  Single-MSM callers set grid_dim_y=1.
+
+// ─── per-curve compile-time constants ────────────────────────────────────────
+//
+// Pallas:  p = 0x40000000000000000000000000000000224698fc094cf91b992d30ed00000001
+// Vesta:   p = 0x40000000000000000000000000000000224698fc0994a8dd8c46eb2100000001
+//
+// Both share the property: limbs[2]=0, limbs[3]=2^62.
+// Compile with -DPALLAS_CURVE or -DVESTA_CURVE to select constants.
+
+// Modulus and Montgomery inverse constants (per curve).
+// mont_one (R = 2^256 mod p) is still loaded from the field_params buffer —
+// not needed at compile time.
+#ifdef PALLAS_CURVE
+#define CURVE_MOD0     0x992d30ed00000001ULL
+#define CURVE_MOD1     0x224698fc094cf91bULL
+#define CURVE_MONT_INV 0x992d30ecffffffffULL
+#endif
+
+#ifdef VESTA_CURVE
+#define CURVE_MOD0     0x8c46eb2100000001ULL
+#define CURVE_MOD1     0x224698fc0994a8ddULL
+#define CURVE_MONT_INV 0x8c46eb20ffffffffULL
+#endif
 
 #define NUM_LIMBS 4
 #define COORDS_PER_POINT 3
@@ -97,47 +123,100 @@ __device__ BigIntSubResult bigint_sub(BigInt a, BigInt b) {
 }
 
 // field_params buffer layout: [modulus(4), inv(1), mont_one(4)] = 9 u64s
+//
+// For Pallas / Vesta the modulus and inv are compile-time constants; only
+// mont_one is read from the buffer, saving 5 global-memory loads per thread.
 __device__ FieldParams load_field(const u64limb* __restrict__ params) {
     FieldParams f;
+#if defined(PALLAS_CURVE) || defined(VESTA_CURVE)
+    f.modulus.limbs[0] = CURVE_MOD0;
+    f.modulus.limbs[1] = CURVE_MOD1;
+    f.modulus.limbs[2] = 0ULL;
+    f.modulus.limbs[3] = 0x4000000000000000ULL;
+    f.inv = CURVE_MONT_INV;
+#else
     for (uint i = 0; i < NUM_LIMBS; i++) f.modulus.limbs[i] = params[i];
     f.inv = params[NUM_LIMBS];
+#endif
     for (uint i = 0; i < NUM_LIMBS; i++) f.mont_one.limbs[i] = params[NUM_LIMBS + 1 + i];
     return f;
 }
 
 // ─── Montgomery field arithmetic ─────────────────────────────────────────────
 
+// Inline helper: add (lo,hi) of a 64×64 product into t[pos] with carry in/out.
+#define MULADD(t_pos, a_val, b_val, carry)                        \
+    do {                                                           \
+        u64limb _lo = (a_val) * (b_val);                          \
+        u64limb _hi = mulhi_u64((a_val), (b_val));                \
+        u64limb _s1 = (t_pos) + _lo;                              \
+        u64limb _c1 = (_s1 < (t_pos)) ? 1ULL : 0ULL;             \
+        u64limb _s2 = _s1 + (carry);                              \
+        u64limb _c2 = (_s2 < _s1) ? 1ULL : 0ULL;                 \
+        (t_pos) = _s2;                                             \
+        (carry) = _hi + _c1 + _c2;                                \
+    } while(0)
+
+// Inline helper: add a shift-based product  m × 2^62  into t[pos],t[pos+1].
+// m × 2^62: lo = m<<62, hi = m>>2.
+#define MULADD_2_62(t_lo, t_hi, m_val, carry)                    \
+    do {                                                           \
+        u64limb _lo = (m_val) << 62;                              \
+        u64limb _hi = (m_val) >> 2;                               \
+        u64limb _s1 = (t_lo) + _lo;                               \
+        u64limb _c1 = (_s1 < (t_lo)) ? 1ULL : 0ULL;              \
+        u64limb _s2 = _s1 + (carry);                              \
+        u64limb _c2 = (_s2 < _s1) ? 1ULL : 0ULL;                 \
+        (t_lo) = _s2;                                              \
+        (carry) = _hi + _c1 + _c2;                                \
+        (void)(t_hi); /* caller propagates carry */                \
+    } while(0)
+
 __device__ BigInt mont_mul(BigInt a, BigInt b, FieldParams f) {
     BigIntWide t;
     for (uint i = 0; i < NUM_LIMBS * 2; i++) t.limbs[i] = 0;
 
+    // ── Step 1: compute full 512-bit product a × b ───────────────────────────
     for (uint i = 0; i < NUM_LIMBS; i++) {
         u64limb carry = 0;
         for (uint j = 0; j < NUM_LIMBS; j++) {
-            u64limb lo  = a.limbs[i] * b.limbs[j];
-            u64limb hi  = mulhi_u64(a.limbs[i], b.limbs[j]);
-            u64limb s1  = t.limbs[i + j] + lo;
-            u64limb c1  = (s1 < t.limbs[i + j]) ? 1ULL : 0ULL;
-            u64limb s2  = s1 + carry;
-            u64limb c2  = (s2 < s1) ? 1ULL : 0ULL;
-            t.limbs[i + j] = s2;
-            carry = hi + c1 + c2;
+            MULADD(t.limbs[i + j], a.limbs[i], b.limbs[j], carry);
         }
         t.limbs[i + NUM_LIMBS] += carry;
     }
 
+    // ── Step 2: Montgomery reduction ─────────────────────────────────────────
+#if defined(PALLAS_CURVE) || defined(VESTA_CURVE)
+    // Specialised for modulus = [CURVE_MOD0, CURVE_MOD1, 0, 2^62].
+    //   j=2: modulus[2]=0  → no multiply, just carry propagation
+    //   j=3: modulus[3]=2^62 → replace multiply with two shifts
+    for (uint i = 0; i < NUM_LIMBS; i++) {
+        u64limb m     = t.limbs[i] * CURVE_MONT_INV;
+        u64limb carry = 0;
+        // j=0
+        MULADD(t.limbs[i    ], m, CURVE_MOD0, carry);
+        // j=1
+        MULADD(t.limbs[i + 1], m, CURVE_MOD1, carry);
+        // j=2: modulus[2]=0 — skip multiply, propagate carry only
+        { u64limb s = t.limbs[i + 2] + carry;
+          carry = (s < t.limbs[i + 2]) ? 1ULL : 0ULL;
+          t.limbs[i + 2] = s; }
+        // j=3: modulus[3]=2^62 — use shifts
+        MULADD_2_62(t.limbs[i + 3], t.limbs[i + 4], m, carry);
+        // Propagate final carry into the upper half.
+        u64limb s = t.limbs[i + NUM_LIMBS] + carry;
+        u64limb c = (s < t.limbs[i + NUM_LIMBS]) ? 1ULL : 0ULL;
+        t.limbs[i + NUM_LIMBS] = s;
+        if (i + NUM_LIMBS + 1 < NUM_LIMBS * 2)
+            t.limbs[i + NUM_LIMBS + 1] += c;
+    }
+#else
+    // Generic reduction using dynamic field params.
     for (uint i = 0; i < NUM_LIMBS; i++) {
         u64limb m = t.limbs[i] * f.inv;
         u64limb carry = 0;
         for (uint j = 0; j < NUM_LIMBS; j++) {
-            u64limb lo  = m * f.modulus.limbs[j];
-            u64limb hi  = mulhi_u64(m, f.modulus.limbs[j]);
-            u64limb s1  = t.limbs[i + j] + lo;
-            u64limb c1  = (s1 < t.limbs[i + j]) ? 1ULL : 0ULL;
-            u64limb s2  = s1 + carry;
-            u64limb c2  = (s2 < s1) ? 1ULL : 0ULL;
-            t.limbs[i + j] = s2;
-            carry = hi + c1 + c2;
+            MULADD(t.limbs[i + j], m, f.modulus.limbs[j], carry);
         }
         u64limb s = t.limbs[i + NUM_LIMBS] + carry;
         u64limb c = (s < t.limbs[i + NUM_LIMBS]) ? 1ULL : 0ULL;
@@ -145,6 +224,7 @@ __device__ BigInt mont_mul(BigInt a, BigInt b, FieldParams f) {
         if (i + NUM_LIMBS + 1 < NUM_LIMBS * 2)
             t.limbs[i + NUM_LIMBS + 1] += c;
     }
+#endif
 
     BigInt result;
     for (uint i = 0; i < NUM_LIMBS; i++) result.limbs[i] = t.limbs[i + NUM_LIMBS];
@@ -487,6 +567,69 @@ extern "C" __global__ void bucket_reduction(
     }
 
     store_jacobian_point(window_sums, msm_sums_off + window_idx, result);
+}
+
+// Fused triangle-reduction + Horner window combination.
+//
+// Replaces the separate bucket_reduction + combine_windows_kernel pair.
+// Savings vs the old design:
+//   • One fewer kernel launch and hipDeviceSynchronize barrier.
+//   • The window_sums intermediate buffer is never written to global memory;
+//     window results pass through LDS within the block.
+//   • The final combined point (12 u64) goes directly to the result buffer.
+//
+// Launch geometry:
+//   blockIdx.y  = MSM index within the batch  (or 0 for single-MSM)
+//   blockIdx.x  = 0  (one block per MSM — pass grid_x=1, grid_y=num_msms)
+//   threadIdx.x = window index  (0 .. num_windows-1)
+//   blockDim.x  = num_windows   (dynamic, set by host)
+//
+// Shared memory (dynamic): num_windows × LIMBS_PER_POINT × 8 bytes.
+//   For window_size=4 and 256-bit scalars: 65 × 12 × 8 = 6 240 bytes.
+//
+// config: [num_windows, num_buckets, window_size]
+extern "C" __global__ void bucket_reduce_combine(
+    const u64limb* __restrict__ buckets,   // [num_msms × num_windows × num_buckets × 12]
+    u64limb*       __restrict__ results,   // [num_msms × 12]
+    const uint*    __restrict__ config,
+    const u64limb* __restrict__ field_params
+) {
+    uint msm_idx     = blockIdx.y;
+    uint window_idx  = threadIdx.x;
+    uint num_windows = config[0];
+    uint num_buckets = config[1];
+    uint window_size = config[2];
+
+    extern __shared__ u64limb lds_rc[];  // dynamic: num_windows × LIMBS_PER_POINT u64limbs
+
+    FieldParams field = load_field(field_params);
+
+    // ── Phase 1: triangle-sum reduction for window window_idx ────────────────
+    uint bucket_base = (msm_idx * num_windows + window_idx) * num_buckets;
+    JacobianPoint running = jacobian_identity();
+    JacobianPoint window_sum = jacobian_identity();
+
+    for (int i = (int)num_buckets - 1; i >= 0; i--) {
+        JacobianPoint b = load_jacobian_point(buckets, bucket_base + (uint)i);
+        running     = jacobian_add(running,    b,       field);
+        window_sum  = jacobian_add(window_sum, running, field);
+    }
+
+    // ── Phase 2: store window_sum to LDS ────────────────────────────────────
+    store_jacobian_point(lds_rc, window_idx, window_sum);
+    __syncthreads();
+
+    // ── Phase 3: Horner combination in thread 0 only ─────────────────────────
+    if (window_idx == 0) {
+        JacobianPoint result = load_jacobian_point(lds_rc, num_windows - 1);
+        for (int i = (int)num_windows - 2; i >= 0; i--) {
+            for (uint d = 0; d < window_size; d++)
+                result = jacobian_double(result, field);
+            JacobianPoint w = load_jacobian_point(lds_rc, (uint)i);
+            result = jacobian_add(result, w, field);
+        }
+        store_jacobian_point(results, msm_idx, result);
+    }
 }
 
 // Combine per-window sums into the final MSM result (Horner's method).

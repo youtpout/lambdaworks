@@ -180,9 +180,29 @@ impl HipState {
     ///
     /// Must be called before any kernel is launched. `name` is used as the
     /// program identifier in hipRTC error messages.
+    #[inline]
     pub fn load_source(&mut self, source: &str, name: &str) -> HipResult<()> {
-        let src_c = CString::new(source).expect("source contains null byte");
+        self.load_source_with_opts(source, name, &[])
+    }
+
+    /// Like [`load_source`] but passes extra compile options (e.g. `-DPALLAS_CURVE`)
+    /// to `hiprtcCompileProgram`.
+    pub fn load_source_with_opts(
+        &mut self,
+        source: &str,
+        name: &str,
+        opts: &[&str],
+    ) -> HipResult<()> {
+        let src_c  = CString::new(source).expect("source contains null byte");
         let name_c = CString::new(name).expect("name contains null byte");
+
+        // Convert option strings to CStrings and then to raw pointers.
+        let opt_cstrings: Vec<CString> = opts
+            .iter()
+            .map(|s| CString::new(*s).expect("option contains null byte"))
+            .collect();
+        let opt_ptrs: Vec<*const std::os::raw::c_char> =
+            opt_cstrings.iter().map(|s| s.as_ptr()).collect();
 
         // Create the hipRTC program.
         let mut prog: HiprtcProgram = std::ptr::null_mut();
@@ -205,9 +225,14 @@ impl HipState {
             }
         }
 
-        // Compile.
-        let compile_code =
-            unsafe { hiprtcCompileProgram(prog, 0, std::ptr::null()) };
+        // Compile with the provided options.
+        let compile_code = unsafe {
+            hiprtcCompileProgram(
+                prog,
+                opt_ptrs.len() as i32,
+                if opt_ptrs.is_empty() { std::ptr::null() } else { opt_ptrs.as_ptr() },
+            )
+        };
 
         if compile_code != 0 {
             let log = self.get_rtc_log(prog);

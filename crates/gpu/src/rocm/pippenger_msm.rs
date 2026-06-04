@@ -139,16 +139,16 @@ pub struct PreparedHipPippengerMSM {
     points_buf: DeviceBuffer,
     partial_buckets_buf: DeviceBuffer,
     buckets_buf: DeviceBuffer,
-    window_sums_buf: DeviceBuffer,
     accum_config_buf: DeviceBuffer,
     merge_config_buf: DeviceBuffer,
-    reduction_config_buf: DeviceBuffer,
+    /// Config for the fused bucket_reduce_combine kernel: [num_windows, num_buckets, window_size].
+    rc_config_buf: DeviceBuffer,
     field_buf: DeviceBuffer,
     result_buf: DeviceBuffer,
-    combine_config_buf: DeviceBuffer,
     effective_windows: usize,
     num_chunks: usize,
     num_buckets: usize,
+    window_size: usize,
 }
 
 // ─── persistent bases ─────────────────────────────────────────────────────────
@@ -219,11 +219,22 @@ impl HipPippengerMSM {
         if self.initialized {
             return Ok(());
         }
+        // Select the curve-specific compile option so hipRTC can inline the
+        // modulus constants and generate the optimised mont_mul.
+        let compile_opt = if self.config.field_modulus == PALLAS_MODULUS {
+            Some("-DPALLAS_CURVE")
+        } else if self.config.field_modulus == VESTA_MODULUS {
+            Some("-DVESTA_CURVE")
+        } else {
+            None
+        };
+        let opts_vec: Vec<&str> = compile_opt.into_iter().collect();
         self.state
-            .load_source(PIPPENGER_MSM_HIP_SOURCE, "pippenger_msm.hip")?;
-        self.state
-            .prepare_function("bucket_accumulation_by_chunk")?;
+            .load_source_with_opts(PIPPENGER_MSM_HIP_SOURCE, "pippenger_msm.hip", &opts_vec)?;
+        self.state.prepare_function("bucket_accumulation_by_chunk")?;
         self.state.prepare_function("bucket_merge")?;
+        self.state.prepare_function("bucket_reduce_combine")?;
+        // Keep the standalone kernels for compatibility / manual use.
         self.state.prepare_function("bucket_reduction")?;
         self.state.prepare_function("combine_windows_kernel")?;
         self.initialized = true;
@@ -293,10 +304,6 @@ impl HipPippengerMSM {
         let buckets_buf =
             self.state.alloc_buffer(buckets_len * std::mem::size_of::<u64>())?;
 
-        let window_sums_buf = self
-            .state
-            .alloc_buffer(effective_windows * LIMBS_PER_POINT * std::mem::size_of::<u64>())?;
-
         let accum_config_buf = self.state.alloc_buffer_with_data(&[
             num_scalars as u32,
             effective_windows as u32,
@@ -309,34 +316,31 @@ impl HipPippengerMSM {
             num_buckets as u32,
             num_chunks as u32,
         ])?;
-        let reduction_config_buf = self
-            .state
-            .alloc_buffer_with_data(&[effective_windows as u32, num_buckets as u32])?;
+        // Fused reduce+combine config: [num_windows, num_buckets, window_size]
+        let rc_config_buf = self.state.alloc_buffer_with_data(&[
+            effective_windows as u32,
+            num_buckets as u32,
+            self.config.window_size as u32,
+        ])?;
         let field_buf = self.field_params_buffer()?;
 
         let result_buf =
             self.state.alloc_buffer(LIMBS_PER_POINT * std::mem::size_of::<u64>())?;
-        let combine_config_buf = self.state.alloc_buffer_with_data(&[
-            effective_windows as u32,
-            self.config.window_size as u32,
-            1u32, // num_msms = 1 for compute_prepared
-        ])?;
 
         Ok(PreparedHipPippengerMSM {
             digits_buf,
             points_buf,
             partial_buckets_buf,
             buckets_buf,
-            window_sums_buf,
             accum_config_buf,
             merge_config_buf,
-            reduction_config_buf,
+            rc_config_buf,
             field_buf,
             result_buf,
-            combine_config_buf,
             effective_windows,
             num_chunks,
             num_buckets,
+            window_size: self.config.window_size,
         })
     }
 
@@ -439,10 +443,6 @@ impl HipPippengerMSM {
         let buckets_buf =
             self.state.alloc_buffer(buckets_len * std::mem::size_of::<u64>())?;
 
-        let window_sums_buf = self.state.alloc_buffer(
-            num_msms * effective_windows * LIMBS_PER_POINT * std::mem::size_of::<u64>(),
-        )?;
-
         let result_buf = self.state.alloc_buffer(
             num_msms * LIMBS_PER_POINT * std::mem::size_of::<u64>(),
         )?;
@@ -460,13 +460,10 @@ impl HipPippengerMSM {
             num_buckets as u32,
             num_chunks as u32,
         ])?;
-        let reduction_config_buf = self
-            .state
-            .alloc_buffer_with_data(&[effective_windows as u32, num_buckets as u32])?;
-        let combine_config_buf = self.state.alloc_buffer_with_data(&[
+        let rc_config_buf = self.state.alloc_buffer_with_data(&[
             effective_windows as u32,
+            num_buckets as u32,
             config.window_size as u32,
-            num_msms as u32,
         ])?;
         let field_buf = self.field_params_buffer()?;
 
@@ -477,33 +474,30 @@ impl HipPippengerMSM {
         let merge_bufs: &[&DeviceBuffer] = &[
             &partial_buckets_buf, &buckets_buf, &merge_config_buf, &field_buf,
         ];
-        let reduc_bufs: &[&DeviceBuffer] = &[
-            &buckets_buf, &window_sums_buf, &reduction_config_buf, &field_buf,
-        ];
-        let combine_bufs: &[&DeviceBuffer] = &[
-            &window_sums_buf, &result_buf, &combine_config_buf, &field_buf,
+        let rc_bufs: &[&DeviceBuffer] = &[
+            &buckets_buf, &result_buf, &rc_config_buf, &field_buf,
         ];
 
         // ── kernel launches ──────────────────────────────────────────────────
-        let accum_gx   = ((effective_windows * num_chunks) as u32 + 255) / 256;
-        let merge_gx   = (effective_windows * num_buckets) as u32; // one block per pair
-        let reduc_gx   = (effective_windows as u32 + 255) / 256;
-        let combine_gx = (num_msms as u32 + 255) / 256;
+        let accum_gx = ((effective_windows * num_chunks) as u32 + 255) / 256;
+        let merge_gx = (effective_windows * num_buckets) as u32;
+        // Fused reduce+combine: one block per MSM, block has effective_windows threads.
+        let rc_block = effective_windows as u32;
+        let rc_shm   = rc_block * LIMBS_PER_POINT as u32 * 8;
 
-        // First 3 kernels: grid_y = num_msms (each MSM gets its own y-slice).
+        // First two kernels: grid_y = num_msms (each MSM gets its own y-slice).
         self.state.execute_kernels_2d(
             &[
                 ("bucket_accumulation_by_chunk", accum_bufs, accum_gx, 256,              0),
                 ("bucket_merge",                 merge_bufs, merge_gx, MERGE_BLOCK_SIZE, MERGE_SHM_BYTES),
-                ("bucket_reduction",             reduc_bufs, reduc_gx, 256,              0),
             ],
             num_msms as u32,
         )?;
 
-        // combine_windows uses a flat 1-D grid: msm_idx = blockIdx.x*256 + threadIdx.x.
+        // Fused reduce+combine: grid_x=1, grid_y=num_msms → one block per MSM.
         self.state.execute_kernels_2d(
-            &[("combine_windows_kernel", combine_bufs, combine_gx, 256, 0)],
-            1,
+            &[("bucket_reduce_combine", rc_bufs, 1, rc_block, rc_shm)],
+            num_msms as u32,
         )?;
 
         // ── read back one Jacobian point per MSM ────────────────────────────
@@ -519,7 +513,6 @@ impl HipPippengerMSM {
         &mut self,
         prepared: &PreparedHipPippengerMSM,
     ) -> HipResult<Vec<u64>> {
-        // No pre-clear: accumulation kernel initialises each bucket to identity.
         let accum_bufs: &[&DeviceBuffer] = &[
             &prepared.digits_buf,
             &prepared.points_buf,
@@ -533,35 +526,24 @@ impl HipPippengerMSM {
             &prepared.merge_config_buf,
             &prepared.field_buf,
         ];
-        let reduc_bufs: &[&DeviceBuffer] = &[
+        let rc_bufs: &[&DeviceBuffer] = &[
             &prepared.buckets_buf,
-            &prepared.window_sums_buf,
-            &prepared.reduction_config_buf,
-            &prepared.field_buf,
-        ];
-
-        let combine_bufs: &[&DeviceBuffer] = &[
-            &prepared.window_sums_buf,
             &prepared.result_buf,
-            &prepared.combine_config_buf,
+            &prepared.rc_config_buf,
             &prepared.field_buf,
         ];
 
-        // Grid sizes:
-        //   accum  – one thread per (window, chunk)
-        //   merge  – one *block* of MERGE_BLOCK_SIZE threads per (window, bucket)
-        //   reduc  – one thread per window
-        //   combine– one thread for the single MSM result
-        let accum_gx = ((prepared.effective_windows * prepared.num_chunks) as u32 + 255) / 256;
-        let merge_gx = (prepared.effective_windows * prepared.num_buckets) as u32;
-        let reduc_gx = (prepared.effective_windows as u32 + 255) / 256;
+        let accum_gx  = ((prepared.effective_windows * prepared.num_chunks) as u32 + 255) / 256;
+        let merge_gx  = (prepared.effective_windows * prepared.num_buckets) as u32;
+        // Fused reduce+combine: one block of effective_windows threads per MSM.
+        let rc_block  = prepared.effective_windows as u32;
+        let rc_shm    = rc_block * LIMBS_PER_POINT as u32 * 8; // dynamic shared memory bytes
 
         self.state.execute_kernels_2d(
             &[
-                ("bucket_accumulation_by_chunk", accum_bufs, accum_gx,  256,              0),
-                ("bucket_merge",                 merge_bufs, merge_gx,  MERGE_BLOCK_SIZE, MERGE_SHM_BYTES),
-                ("bucket_reduction",             reduc_bufs, reduc_gx,  256,              0),
-                ("combine_windows_kernel",       combine_bufs, 1,       256,              0),
+                ("bucket_accumulation_by_chunk", accum_bufs, accum_gx, 256,              0),
+                ("bucket_merge",                 merge_bufs, merge_gx, MERGE_BLOCK_SIZE, MERGE_SHM_BYTES),
+                ("bucket_reduce_combine",        rc_bufs,    1,        rc_block,         rc_shm),
             ],
             1,
         )?;
@@ -641,10 +623,6 @@ impl HipPippengerMSM {
         let buckets_buf =
             self.state.alloc_buffer(buckets_len * std::mem::size_of::<u64>())?;
 
-        let window_sums_buf = self.state.alloc_buffer(
-            effective_windows * LIMBS_PER_POINT * std::mem::size_of::<u64>(),
-        )?;
-
         let result_buf = self.state.alloc_buffer(LIMBS_PER_POINT * std::mem::size_of::<u64>())?;
 
         // Config buffers.
@@ -660,13 +638,11 @@ impl HipPippengerMSM {
             num_buckets as u32,
             num_chunks as u32,
         ])?;
-        let reduction_config_buf = self
-            .state
-            .alloc_buffer_with_data(&[effective_windows as u32, num_buckets as u32])?;
-        let combine_config_buf = self.state.alloc_buffer_with_data(&[
+        // Fused reduce+combine config: [num_windows, num_buckets, window_size]
+        let rc_config_buf = self.state.alloc_buffer_with_data(&[
             effective_windows as u32,
+            num_buckets as u32,
             config.window_size as u32,
-            1u32,
         ])?;
 
         let accum_bufs: &[&DeviceBuffer] = &[
@@ -676,23 +652,21 @@ impl HipPippengerMSM {
         let merge_bufs: &[&DeviceBuffer] = &[
             &partial_buckets_buf, &buckets_buf, &merge_config_buf, &bases.field_buf,
         ];
-        let reduc_bufs: &[&DeviceBuffer] = &[
-            &buckets_buf, &window_sums_buf, &reduction_config_buf, &bases.field_buf,
-        ];
-        let combine_bufs: &[&DeviceBuffer] = &[
-            &window_sums_buf, &result_buf, &combine_config_buf, &bases.field_buf,
+        let rc_bufs: &[&DeviceBuffer] = &[
+            &buckets_buf, &result_buf, &rc_config_buf, &bases.field_buf,
         ];
 
         let accum_gx = ((effective_windows * num_chunks) as u32 + 255) / 256;
         let merge_gx = (effective_windows * num_buckets) as u32;
-        let reduc_gx = (effective_windows as u32 + 255) / 256;
+        // Fused reduce+combine: one block of effective_windows threads.
+        let rc_block = effective_windows as u32;
+        let rc_shm   = rc_block * LIMBS_PER_POINT as u32 * 8;
 
         self.state.execute_kernels_2d(
             &[
-                ("bucket_accumulation_by_chunk", accum_bufs, accum_gx,  256,              0),
-                ("bucket_merge",                 merge_bufs, merge_gx,  MERGE_BLOCK_SIZE, MERGE_SHM_BYTES),
-                ("bucket_reduction",             reduc_bufs, reduc_gx,  256,              0),
-                ("combine_windows_kernel",       combine_bufs, 1,       256,              0),
+                ("bucket_accumulation_by_chunk", accum_bufs, accum_gx, 256,              0),
+                ("bucket_merge",                 merge_bufs, merge_gx, MERGE_BLOCK_SIZE, MERGE_SHM_BYTES),
+                ("bucket_reduce_combine",        rc_bufs,    1,        rc_block,         rc_shm),
             ],
             1,
         )?;
