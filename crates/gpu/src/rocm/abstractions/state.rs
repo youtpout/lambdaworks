@@ -325,6 +325,32 @@ impl HipState {
         Ok(buf)
     }
 
+    /// Upload `data` from the host into an already-allocated device buffer.
+    ///
+    /// The buffer must be at least as large as `data`. Lets callers reuse a
+    /// persistent buffer across launches instead of reallocating every call.
+    pub fn upload_into<T: Copy>(&self, buf: &DeviceBuffer, data: &[T]) -> HipResult<()> {
+        let bytes = std::mem::size_of_val(data);
+        if bytes > buf.len {
+            return Err(HipError::MemcpyError(format!(
+                "upload_into: data {} bytes exceeds buffer {} bytes",
+                bytes, buf.len
+            )));
+        }
+        let code = unsafe {
+            hipMemcpy(
+                buf.ptr,
+                data.as_ptr() as *const std::ffi::c_void,
+                bytes,
+                HIP_MEMCPY_HOST_TO_DEVICE,
+            )
+        };
+        if code != 0 {
+            return Err(HipError::MemcpyError(format!("H->D failed, code {}", code)));
+        }
+        Ok(())
+    }
+
     /// Download `count` elements of type `T` from a device buffer.
     pub fn read_buffer<T: Copy + Default>(&self, buf: &DeviceBuffer, count: usize) -> HipResult<Vec<T>> {
         let bytes = count * std::mem::size_of::<T>();

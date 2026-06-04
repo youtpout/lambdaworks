@@ -172,6 +172,10 @@ pub struct HipPippengerMSM {
     state: HipState,
     config: HipPippengerMSMConfig,
     initialized: bool,
+    /// Cached workspace from the last `compute()` call, keyed by point count.
+    /// Repeated MSMs of the same size reuse all device buffers (only the
+    /// scalar/point inputs are re-uploaded), avoiding per-call reallocation.
+    workspace: Option<(usize, PreparedHipPippengerMSM)>,
 }
 
 impl HipPippengerMSM {
@@ -181,6 +185,7 @@ impl HipPippengerMSM {
             state,
             config,
             initialized: false,
+            workspace: None,
         })
     }
 
@@ -249,12 +254,63 @@ impl HipPippengerMSM {
     /// Automatically derives the optimal `window_size` and `chunk_size` for the
     /// given input length.  `self.config` is restored after the call.
     pub fn compute(&mut self, scalars: &[u64], points: &[u64]) -> HipResult<Vec<u64>> {
+        if !self.initialized {
+            self.initialize()?;
+        }
         let num_points = points.len() / LIMBS_PER_AFFINE;
         let optimal = self.config_for_num_points(num_points);
         let prev_config = std::mem::replace(&mut self.config, optimal);
-        let result = self.prepare(scalars, points).and_then(|p| self.compute_prepared(&p));
+        let result = self.compute_cached(scalars, points, num_points);
         self.config = prev_config;
         result
+    }
+
+    /// `compute()` body running under the already-selected optimal config.
+    ///
+    /// Reuses the cached workspace when the point count matches the previous
+    /// call (only re-uploading the scalar/point inputs); otherwise builds and
+    /// caches a fresh workspace.
+    fn compute_cached(
+        &mut self,
+        scalars: &[u64],
+        points: &[u64],
+        num_points: usize,
+    ) -> HipResult<Vec<u64>> {
+        let reuse = matches!(&self.workspace, Some((np, _)) if *np == num_points);
+        if reuse {
+            // Validate inputs (prepare() does this on the fresh path).
+            if scalars.len() % self.config.scalar_limbs != 0 {
+                return Err(HipError::InvalidInputSize {
+                    expected: self.config.scalar_limbs,
+                    actual: scalars.len(),
+                });
+            }
+            if points.len() % LIMBS_PER_AFFINE != 0 {
+                return Err(HipError::InvalidInputSize {
+                    expected: LIMBS_PER_AFFINE,
+                    actual: points.len(),
+                });
+            }
+            let num_scalars = scalars.len() / self.config.scalar_limbs;
+            if num_scalars != num_points {
+                return Err(HipError::LengthMismatch(num_scalars, num_points));
+            }
+
+            // Re-upload only the inputs into the persistent buffers.
+            let mut entry = self.workspace.take().unwrap();
+            let signed_digits = recode_scalars_signed(&self.config, scalars, num_points);
+            self.state.upload_into(&entry.1.digits_buf, &signed_digits)?;
+            self.state.upload_into(&entry.1.points_buf, points)?;
+            let result = self.compute_prepared(&entry.1);
+            self.workspace = Some(entry);
+            result
+        } else {
+            // Fresh allocation; cache it for subsequent same-size calls.
+            let prepared = self.prepare(scalars, points)?;
+            let result = self.compute_prepared(&prepared);
+            self.workspace = Some((num_points, prepared));
+            result
+        }
     }
 
     pub fn prepare(
@@ -714,24 +770,26 @@ fn recode_scalars_signed(
     let full_bucket   = 1i32 << window_size;
     let mask          = (1u64 << window_size) - 1;
     let eff_windows   = num_windows + 1;
+    let scalar_limbs  = config.scalar_limbs;
 
     let mut digits = vec![0i8; num_scalars * eff_windows];
 
-    for scalar_idx in 0..num_scalars {
-        let scalar_base = scalar_idx * config.scalar_limbs;
-        let mut carry   = 0i32;
-
+    // Recode one scalar into the transposed output [window][scalar] column.
+    // Each scalar has an independent carry chain, so scalars are processed in
+    // parallel; the per-scalar writes target disjoint columns of `digits`.
+    let recode_one = |scalar_idx: usize, out: &mut [i8]| {
+        let scalar_base = scalar_idx * scalar_limbs;
+        let mut carry = 0i32;
         for window_idx in 0..num_windows {
             let bit_offset  = window_idx * window_size;
             let limb_idx    = bit_offset / 64;
             let bit_in_limb = bit_offset % 64;
 
-            let raw_val = if limb_idx < config.scalar_limbs {
+            let raw_val = if limb_idx < scalar_limbs {
                 let mut val = (scalars[scalar_base + limb_idx] >> bit_in_limb) & mask;
-                if bit_in_limb + window_size > 64 && limb_idx + 1 < config.scalar_limbs {
+                if bit_in_limb + window_size > 64 && limb_idx + 1 < scalar_limbs {
                     let remaining = bit_in_limb + window_size - 64;
-                    val |= (scalars[scalar_base + limb_idx + 1]
-                        & ((1u64 << remaining) - 1))
+                    val |= (scalars[scalar_base + limb_idx + 1] & ((1u64 << remaining) - 1))
                         << (64 - bit_in_limb);
                 }
                 val
@@ -747,11 +805,38 @@ fn recode_scalars_signed(
                 carry = 0;
                 window_val
             };
-
-            // Transposed layout: [window][scalar]
-            digits[window_idx * num_scalars + scalar_idx] = digit as i8;
+            out[window_idx * num_scalars + scalar_idx] = digit as i8;
         }
-        digits[num_windows * num_scalars + scalar_idx] = carry as i8;
+        out[num_windows * num_scalars + scalar_idx] = carry as i8;
+    };
+
+    // Parallelise over scalars. Writes go to disjoint columns of `digits`
+    // (column `scalar_idx`, one entry per window row), so concurrent strided
+    // writes through a shared raw pointer are data-race free.
+    #[cfg(feature = "rocm")]
+    {
+        use rayon::prelude::*;
+        struct ColPtr(*mut i8);
+        impl ColPtr {
+            #[inline]
+            fn ptr(&self) -> *mut i8 {
+                self.0
+            }
+        }
+        // SAFETY: each task writes only indices `w * num_scalars + scalar_idx`
+        // for its own `scalar_idx`; these index sets are disjoint across tasks.
+        unsafe impl Sync for ColPtr {}
+        let len = num_scalars * eff_windows;
+        let base = ColPtr(digits.as_mut_ptr());
+        (0..num_scalars).into_par_iter().for_each(|scalar_idx| {
+            // Method call borrows the whole `ColPtr` (Sync), not the bare pointer.
+            let out = unsafe { std::slice::from_raw_parts_mut(base.ptr(), len) };
+            recode_one(scalar_idx, out);
+        });
+    }
+    #[cfg(not(feature = "rocm"))]
+    for scalar_idx in 0..num_scalars {
+        recode_one(scalar_idx, &mut digits);
     }
 
     digits
@@ -1203,6 +1288,42 @@ mod tests {
             assert_eq!(&rout[base..base + 4], &xr, "x mismatch at pair {i}");
             assert_eq!(&rout[base + 4..base + 8], &yr, "y mismatch at pair {i}");
         }
+    }
+
+    #[test]
+    #[ignore = "timing measurement, run manually with --ignored --nocapture"]
+    fn time_compute_vs_prepared() {
+        let n = 4096usize;
+        let mut x = 0x1234_5678_9abc_def0u64;
+        let mut next = || { x = x.wrapping_mul(6364136223846793005).wrapping_add(1); x };
+        let mut scalars = vec![0u64; n * COORD_LIMBS];
+        for s in scalars.iter_mut() { *s = next() & 0x3fff_ffff_ffff_ffff; }
+        let mut points = vec![0u64; n * LIMBS_PER_AFFINE];
+        for p in points.iter_mut() { *p = next() & 0x3fff_ffff_ffff_ffff; }
+
+        let mut msm = HipPippengerMSM::new_pallas().unwrap();
+        msm.initialize().unwrap();
+
+        let iters = 30;
+        // Warm up.
+        let _ = msm.compute(&scalars, &points).unwrap();
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters { let _ = msm.compute(&scalars, &points).unwrap(); }
+        let dt_compute = t0.elapsed().as_secs_f64() / iters as f64;
+
+        let optimal = msm.config_for_num_points(n);
+        let prev = std::mem::replace(&mut msm.config, optimal);
+        let prepared = msm.prepare(&scalars, &points).unwrap();
+        let _ = msm.compute_prepared(&prepared).unwrap();
+        let t1 = std::time::Instant::now();
+        for _ in 0..iters { let _ = msm.compute_prepared(&prepared).unwrap(); }
+        let dt_prepared = t1.elapsed().as_secs_f64() / iters as f64;
+        msm.config = prev;
+
+        eprintln!("n={n}  compute()        = {:.3} ms", dt_compute * 1e3);
+        eprintln!("n={n}  compute_prepared = {:.3} ms", dt_prepared * 1e3);
+        eprintln!("n={n}  per-call overhead = {:.3} ms", (dt_compute - dt_prepared) * 1e3);
     }
 
     #[test]

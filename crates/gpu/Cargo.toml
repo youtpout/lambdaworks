@@ -9,6 +9,7 @@ license.workspace = true
 
 [dependencies]
 thiserror = "1.0.38"
+rayon = { version = "1.7", optional = true }
 
 # Metal dependencies (macOS only)
 metal = { version = "0.29", optional = true }
@@ -35,7 +36,7 @@ cuda = ["dep:walkdir"]
 metal = ["dep:metal", "dep:objc", "dep:walkdir"]
 # ROCm/HIP backend for AMD GPUs.
 # Requires ROCm ≥ 5.0 installed (libamdhip64 + libhiprtc on the link path).
-rocm = []
+rocm = ["dep:rayon"]
 
 # Some features activate compilation of code which isn't
 # supported in all machines (e.g. metal, cuda), so we won't
