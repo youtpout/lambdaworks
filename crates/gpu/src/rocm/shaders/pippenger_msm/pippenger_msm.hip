@@ -269,6 +269,49 @@ __device__ BigInt field_neg(BigInt a, FieldParams f) {
     return r.result;
 }
 
+// ─── Montgomery modular inverse (Fermat: a^(p-2)) ─────────────────────────────
+//
+// Inputs/outputs in Montgomery form.  ~254 squarings + ~one mul per set exponent
+// bit ≈ 380 mont_muls.  Expensive on its own — only used as the single "real"
+// inversion that the batch-inversion trick amortises over many elements.
+__device__ BigInt mont_inverse(BigInt a, FieldParams f) {
+    // exponent = modulus - 2
+    BigInt two = bigint_zero(); two.limbs[0] = 2ULL;
+    BigInt exp = bigint_sub(f.modulus, two).result;
+
+    BigInt result = f.mont_one;   // 1 in Montgomery form
+    BigInt base   = a;
+    for (uint limb = 0; limb < NUM_LIMBS; limb++) {
+        u64limb e = exp.limbs[limb];
+        for (uint bit = 0; bit < 64; bit++) {
+            if (e & 1ULL) result = mont_mul(result, base, f);
+            base = mont_square(base, f);
+            e >>= 1;
+        }
+    }
+    return result;
+}
+
+// Batch inversion via Montgomery's trick over a contiguous array slice held by
+// one thread.  N independent inverses cost 3·(N−1) muls + 1 inversion instead of
+// N inversions.  `vals` and `out` may alias.  Caller guarantees all vals ≠ 0.
+//
+//   prefix products → single inverse → back-substitution
+__device__ void batch_inverse_local(const BigInt* vals, BigInt* out, uint n, FieldParams f,
+                                     BigInt* scratch) {
+    // scratch[i] = vals[0] * vals[1] * ... * vals[i]
+    scratch[0] = vals[0];
+    for (uint i = 1; i < n; i++) scratch[i] = mont_mul(scratch[i - 1], vals[i], f);
+
+    BigInt inv = mont_inverse(scratch[n - 1], f);   // (∏ vals)^{-1}
+
+    for (uint i = n - 1; i > 0; i--) {
+        out[i] = mont_mul(inv, scratch[i - 1], f);   // vals[i]^{-1}
+        inv    = mont_mul(inv, vals[i], f);          // strip vals[i]
+    }
+    out[0] = inv;
+}
+
 // ─── Jacobian point operations ────────────────────────────────────────────────
 
 __device__ JacobianPoint jacobian_identity() {
@@ -664,4 +707,35 @@ extern "C" __global__ void combine_windows_kernel(
     }
 
     store_jacobian_point(results, msm_idx, result);
+}
+
+// ─── test kernel: batch inverse ──────────────────────────────────────────────
+//
+// Single thread inverts `n` field elements (Montgomery form) in place.
+// config: [n].  Used by the correctness test only.
+#define BATCH_INV_TEST_MAX 512
+extern "C" __global__ void batch_inverse_test(
+    const u64limb* __restrict__ vals,   // [n × NUM_LIMBS]
+    u64limb*       __restrict__ out,    // [n × NUM_LIMBS]
+    const uint*    __restrict__ config,
+    const u64limb* __restrict__ field_params
+) {
+    if (blockIdx.x * blockDim.x + threadIdx.x != 0) return;
+    uint n = config[0];
+    if (n > BATCH_INV_TEST_MAX) return;
+
+    FieldParams field = load_field(field_params);
+
+    BigInt in[BATCH_INV_TEST_MAX];
+    BigInt res[BATCH_INV_TEST_MAX];
+    BigInt scratch[BATCH_INV_TEST_MAX];
+    for (uint i = 0; i < n; i++)
+        for (uint l = 0; l < NUM_LIMBS; l++)
+            in[i].limbs[l] = vals[i * NUM_LIMBS + l];
+
+    batch_inverse_local(in, res, n, field, scratch);
+
+    for (uint i = 0; i < n; i++)
+        for (uint l = 0; l < NUM_LIMBS; l++)
+            out[i * NUM_LIMBS + l] = res[i].limbs[l];
 }

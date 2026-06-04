@@ -1050,6 +1050,63 @@ mod tests {
     }
 
     #[test]
+    fn batch_inverse_matches_cpu_pallas() {
+        let mut msm = HipPippengerMSM::new_pallas().unwrap();
+        msm.initialize().unwrap();
+        msm.state.prepare_function("batch_inverse_test").unwrap();
+
+        let f = FieldParams {
+            modulus: PALLAS_MODULUS,
+            inv: montgomery_inv64(PALLAS_MODULUS[0]),
+        };
+        let mont_one = compute_mont_one(&PALLAS_MODULUS);
+
+        // n deterministic pseudo-random nonzero residues in [1, p).
+        let n = 100usize;
+        let mut x = 0x0123_4567_89ab_cdefu64;
+        let mut elems: Vec<[u64; COORD_LIMBS]> = Vec::with_capacity(n);
+        let mut vals: Vec<u64> = Vec::with_capacity(n * COORD_LIMBS);
+        for _ in 0..n {
+            let mut e = [0u64; COORD_LIMBS];
+            for limb in e.iter_mut() {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+                *limb = x;
+            }
+            // e[3] < 2^62 ⇒ e < 2^254 < p, guaranteeing a valid residue.
+            e[3] &= 0x3fff_ffff_ffff_ffff;
+            if e == [0u64; COORD_LIMBS] {
+                e[0] = 1;
+            }
+            elems.push(e);
+            vals.extend_from_slice(&e);
+        }
+
+        let vals_buf = msm.state.alloc_buffer_with_data(&vals).unwrap();
+        let out_buf = msm
+            .state
+            .alloc_buffer(n * COORD_LIMBS * std::mem::size_of::<u64>())
+            .unwrap();
+        let cfg_buf = msm.state.alloc_buffer_with_data(&[n as u32]).unwrap();
+        let field_buf = msm.field_params_buffer().unwrap();
+
+        msm.state
+            .execute_compute(
+                "batch_inverse_test",
+                &[&vals_buf, &out_buf, &cfg_buf, &field_buf],
+                1,
+            )
+            .unwrap();
+        let out: Vec<u64> = msm.state.read_buffer(&out_buf, n * COORD_LIMBS).unwrap();
+
+        for (i, a) in elems.iter().enumerate() {
+            let mut b = [0u64; COORD_LIMBS];
+            b.copy_from_slice(&out[i * COORD_LIMBS..(i + 1) * COORD_LIMBS]);
+            // batch_inverse returns b with mont_mul(a, b) == mont_one (= R mod p).
+            assert_eq!(mont_mul(a, &b, &f), mont_one, "wrong inverse at element {i}");
+        }
+    }
+
+    #[test]
     fn identity_arithmetic_is_stable() {
         let field = FieldParams {
             modulus: PALLAS_MODULUS,
