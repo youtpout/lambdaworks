@@ -1206,6 +1206,101 @@ mod tests {
     }
 
     #[test]
+    fn bucket_counting_sort_matches_cpu() {
+        let mut msm = HipPippengerMSM::new_pallas().unwrap();
+        msm.initialize().unwrap();
+        msm.state.prepare_function("bucket_counting_sort").unwrap();
+
+        let config = HipPippengerMSMConfig {
+            window_size: 4,
+            ..HipPippengerMSMConfig::pallas()
+        };
+        let ns = 50usize;
+        let nb = config.num_buckets();
+        let nw = config.num_windows() + 1; // include carry window
+
+        // Deterministic pseudo-random scalars.
+        let mut x = 0xfeed_face_cafe_d00du64;
+        let mut scalars: Vec<u64> = Vec::with_capacity(ns * COORD_LIMBS);
+        for _ in 0..ns * COORD_LIMBS {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+            scalars.push(x);
+        }
+        let digits = recode_scalars_signed(&config, &scalars, ns); // [window][scalar]
+
+        let digits_buf = msm.state.alloc_buffer_with_data(&digits).unwrap();
+        let idx_buf = msm
+            .state
+            .alloc_buffer(nw * ns * std::mem::size_of::<u32>())
+            .unwrap();
+        let sign_buf = msm.state.alloc_buffer(nw * ns).unwrap();
+        let start_buf = msm
+            .state
+            .alloc_buffer(nw * nb * std::mem::size_of::<u32>())
+            .unwrap();
+        let counts_buf = msm
+            .state
+            .alloc_buffer(nw * nb * std::mem::size_of::<u32>())
+            .unwrap();
+        let cfg_buf = msm
+            .state
+            .alloc_buffer_with_data(&[ns as u32, nw as u32, nb as u32])
+            .unwrap();
+
+        msm.state
+            .execute_compute(
+                "bucket_counting_sort",
+                &[&digits_buf, &idx_buf, &sign_buf, &start_buf, &counts_buf, &cfg_buf],
+                nw as u64,
+            )
+            .unwrap();
+
+        let g_idx: Vec<u32> = msm.state.read_buffer(&idx_buf, nw * ns).unwrap();
+        let g_sign: Vec<i8> = msm.state.read_buffer(&sign_buf, nw * ns).unwrap();
+        let g_start: Vec<u32> = msm.state.read_buffer(&start_buf, nw * nb).unwrap();
+        let g_counts: Vec<u32> = msm.state.read_buffer(&counts_buf, nw * nb).unwrap();
+
+        for w in 0..nw {
+            let mut counts = vec![0u32; nb];
+            for s in 0..ns {
+                let d = digits[w * ns + s] as i32;
+                if d == 0 {
+                    continue;
+                }
+                let b = if d > 0 { (d - 1) as usize } else { (-d - 1) as usize };
+                counts[b] += 1;
+            }
+            let mut start = vec![0u32; nb];
+            let mut acc = 0u32;
+            for b in 0..nb {
+                start[b] = acc;
+                acc += counts[b];
+            }
+            let mut cursor = start.clone();
+            let mut idx = vec![0u32; ns];
+            let mut sign = vec![0i8; ns];
+            for s in 0..ns {
+                let d = digits[w * ns + s] as i32;
+                if d == 0 {
+                    continue;
+                }
+                let b = if d > 0 { (d - 1) as usize } else { (-d - 1) as usize };
+                let pos = cursor[b] as usize;
+                cursor[b] += 1;
+                idx[pos] = s as u32;
+                sign[pos] = if d > 0 { 1 } else { -1 };
+            }
+
+            assert_eq!(&g_counts[w * nb..w * nb + nb], &counts[..], "counts w={w}");
+            assert_eq!(&g_start[w * nb..w * nb + nb], &start[..], "start w={w}");
+            // Only the first `acc` entries of the sorted arrays are defined.
+            let placed = acc as usize;
+            assert_eq!(&g_idx[w * ns..w * ns + placed], &idx[..placed], "idx w={w}");
+            assert_eq!(&g_sign[w * ns..w * ns + placed], &sign[..placed], "sign w={w}");
+        }
+    }
+
+    #[test]
     fn identity_arithmetic_is_stable() {
         let field = FieldParams {
             modulus: PALLAS_MODULUS,

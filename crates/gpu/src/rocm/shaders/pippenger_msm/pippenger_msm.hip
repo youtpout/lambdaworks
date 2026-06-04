@@ -817,3 +817,76 @@ extern "C" __global__ void batch_affine_add_test(
         }
     }
 }
+
+// ─── affine MSM stage 3a: counting sort of points by bucket ───────────────────
+//
+// For each window, group point indices by their (signed-digit) bucket so that
+// all points destined for the same bucket become contiguous — the precondition
+// for segmented batch-affine accumulation.
+//
+// One THREAD per window (correctness-first; parallelise later).  Uses the global
+// bucket_counts array as per-window scratch.  Counting sort is stable in
+// increasing point index, which a CPU reference can reproduce exactly.
+//
+// config: [num_scalars, num_windows, num_buckets]
+// Outputs (per window w, contiguous slices of length num_scalars / num_buckets):
+//   sorted_idx[w*ns + k]   = point index of the k-th entry (bucket-major order)
+//   sorted_sign[w*ns + k]  = +1 / -1 sign of that point's digit
+//   bucket_start[w*nb + b] = first k for bucket b
+//   bucket_counts[w*nb + b]= number of points in bucket b
+extern "C" __global__ void bucket_counting_sort(
+    const signed char* __restrict__ digits,   // i8, transposed [window][scalar]
+    uint*          __restrict__ sorted_idx,
+    signed char*   __restrict__ sorted_sign,
+    uint*          __restrict__ bucket_start,
+    uint*          __restrict__ bucket_counts,
+    const uint*    __restrict__ config
+) {
+    uint w = blockIdx.x * blockDim.x + threadIdx.x;
+    uint num_scalars = config[0];
+    uint num_windows = config[1];
+    uint num_buckets = config[2];
+    if (w >= num_windows) return;
+
+    uint cbase = w * num_buckets;
+    uint sbase = w * num_scalars;
+    uint dbase = w * num_scalars;   // transposed digit layout
+
+    // Pass 1: histogram.
+    for (uint b = 0; b < num_buckets; b++) bucket_counts[cbase + b] = 0;
+    for (uint s = 0; s < num_scalars; s++) {
+        int d = (int)digits[dbase + s];
+        if (d == 0) continue;
+        uint b = (d > 0) ? (uint)(d - 1) : (uint)(-d - 1);
+        bucket_counts[cbase + b]++;
+    }
+
+    // Pass 2: exclusive prefix sum → start offsets.
+    uint acc = 0;
+    for (uint b = 0; b < num_buckets; b++) {
+        bucket_start[cbase + b] = acc;
+        acc += bucket_counts[cbase + b];
+    }
+
+    // Pass 3: stable scatter using a running cursor seeded from start offsets.
+    // Reuse the tail of sorted_idx? No — need a separate cursor.  We re-walk and
+    // recompute the cursor from bucket_start by counting placed-so-far implicitly:
+    // place into start[b] + (running per-bucket counter).  Store counters in the
+    // upper unused region is messy; instead decrement a local copy via counts.
+    // Simplest correct approach: second cursor array piggybacks on bucket_counts
+    // is destroyed, so recompute cursor on the fly using start + emitted count.
+    // We use bucket_counts as the live cursor (reset to start values first).
+    for (uint b = 0; b < num_buckets; b++) bucket_counts[cbase + b] = bucket_start[cbase + b];
+    for (uint s = 0; s < num_scalars; s++) {
+        int d = (int)digits[dbase + s];
+        if (d == 0) continue;
+        uint b = (d > 0) ? (uint)(d - 1) : (uint)(-d - 1);
+        uint pos = bucket_counts[cbase + b]++;
+        sorted_idx[sbase + pos]  = s;
+        sorted_sign[sbase + pos] = (d > 0) ? (signed char)1 : (signed char)-1;
+    }
+
+    // Restore counts (cursor now holds start+count = next bucket's start).
+    for (uint b = 0; b < num_buckets; b++)
+        bucket_counts[cbase + b] -= bucket_start[cbase + b];
+}
